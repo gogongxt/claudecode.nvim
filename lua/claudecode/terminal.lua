@@ -65,6 +65,11 @@ local function validate_and_enhance_provider(provider)
     "is_available",
   }
 
+  -- Optional functions for enhanced functionality
+  local optional_functions = {
+    "set_current_instance", -- For multi-instance support
+  }
+
   -- Validate all required functions exist and are callable
   for _, func_name in ipairs(required_functions) do
     local func = provider[func_name]
@@ -128,12 +133,23 @@ local function get_provider()
     end
     -- Fall through to native provider
   elseif defaults.provider == "auto" then
-    -- Try snacks first, then fallback to native silently
+    -- Try toggleterm first, then snacks, then fallback to native silently
+    local toggleterm_provider = load_provider("toggleterm")
+    if toggleterm_provider and toggleterm_provider.is_available() then
+      return toggleterm_provider
+    end
     local snacks_provider = load_provider("snacks")
     if snacks_provider and snacks_provider.is_available() then
       return snacks_provider
     end
     -- Fall through to native provider
+  elseif defaults.provider == "toggleterm" then
+    local toggleterm_provider = load_provider("toggleterm")
+    if toggleterm_provider and toggleterm_provider.is_available() then
+      return toggleterm_provider
+    else
+      logger.warn("'toggleterm' provider configured, but toggleterm not available. Falling back to 'native'.")
+    end
   elseif defaults.provider == "snacks" then
     local snacks_provider = load_provider("snacks")
     if snacks_provider and snacks_provider.is_available() then
@@ -289,7 +305,7 @@ end
 ---@param cmd_args string? Optional arguments to append to the command
 ---@return string cmd_string The command string
 ---@return table env_table The environment variables table
-local function get_claude_command_and_env(cmd_args)
+local function get_claude_command_and_env(cmd_args, opts_override_env)
   -- Inline get_claude_command logic
   local cmd_from_config = defaults.terminal_cmd
   local base_cmd
@@ -306,7 +322,31 @@ local function get_claude_command_and_env(cmd_args)
     cmd_string = base_cmd
   end
 
-  local sse_port_value = claudecode_server_module.state.port
+  -- Check for instance-specific port first (from opts_override_env, environment, or provider)
+  local sse_port_value = nil
+
+  -- Try to get port from opts_override_env first (multi-instance mode)
+  if opts_override_env and opts_override_env.CLAUDE_CODE_SSE_PORT then
+    sse_port_value = tonumber(opts_override_env.CLAUDE_CODE_SSE_PORT)
+  end
+
+  -- Try to get port from environment next
+  if not sse_port_value then
+    local env_port_ok, env_port = pcall(vim.fn.getenv, "CLAUDE_CODE_SSE_PORT")
+    if env_port_ok and env_port and env_port ~= "" then
+      sse_port_value = tonumber(env_port)
+    end
+  end
+
+  -- Fallback to instance manager's active instance port
+  if not sse_port_value then
+    local instance_manager = require("claudecode.instance_manager")
+    local active_instance = instance_manager.get_active_instance()
+    if active_instance and active_instance.port then
+      sse_port_value = active_instance.port
+    end
+  end
+
   local env_table = {
     ENABLE_IDE_INTEGRATION = "true",
     FORCE_CODE_TERMINAL = "true",
@@ -327,6 +367,23 @@ local function get_claude_command_and_env(cmd_args)
   -- First, ensure proxy vars are set to empty strings to override system environment
   for _, var in ipairs(proxy_vars) do
     env_table[var] = ""
+  end
+
+  -- Merge environment variables from opts_override (from instance_manager)
+  if opts_override_env then
+    for key, value in pairs(opts_override_env) do
+      -- Don't allow user config to re-add proxy variables
+      local is_proxy_var = false
+      for _, proxy_var in ipairs(proxy_vars) do
+        if key == proxy_var then
+          is_proxy_var = true
+          break
+        end
+      end
+      if not is_proxy_var then
+        env_table[key] = value
+      end
+    end
   end
 
   -- Merge custom environment variables from config (but don't allow proxy override)
@@ -369,7 +426,9 @@ local function ensure_terminal_visible_no_focus(opts_override, cmd_args)
 
   -- Terminal is not visible, open it without focus
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  -- Extract environment variables from opts_override for multi-instance support
+  local opts_override_env = opts_override and opts_override.env or nil
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, opts_override_env)
 
   provider.open(cmd_string, claude_env_table, effective_config, false) -- false = don't focus
   return true
@@ -425,7 +484,7 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
         )
       end
     elseif k == "provider" then
-      if type(v) == "table" or v == "snacks" or v == "native" or v == "external" or v == "auto" or v == "none" then
+      if type(v) == "table" or v == "toggleterm" or v == "snacks" or v == "native" or v == "external" or v == "auto" or v == "none" then
         defaults.provider = v
       else
         vim.notify(
@@ -521,7 +580,9 @@ end
 ---@param cmd_args string? Arguments to append to the claude command.
 function M.open(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  -- Extract environment variables from opts_override for multi-instance support
+  local opts_override_env = opts_override and opts_override.env or nil
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, opts_override_env)
 
   get_provider().open(cmd_string, claude_env_table, effective_config)
 end
@@ -536,7 +597,9 @@ end
 ---@param cmd_args string? Arguments to append to the claude command.
 function M.simple_toggle(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  -- Extract environment variables from opts_override for multi-instance support
+  local opts_override_env = opts_override and opts_override.env or nil
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, opts_override_env)
 
   get_provider().simple_toggle(cmd_string, claude_env_table, effective_config)
 end
@@ -546,7 +609,9 @@ end
 ---@param cmd_args string|nil (optional) Arguments to append to the claude command.
 function M.focus_toggle(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  -- Extract environment variables from opts_override for multi-instance support
+  local opts_override_env = opts_override and opts_override.env or nil
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, opts_override_env)
 
   get_provider().focus_toggle(cmd_string, claude_env_table, effective_config)
 end
@@ -590,6 +655,12 @@ function M._get_managed_terminal_for_test()
     return provider._get_terminal_for_test()
   end
   return nil
+end
+
+---Gets the current terminal provider (for advanced usage)
+---@return table|nil provider The terminal provider
+function M.get_provider()
+  return get_provider()
 end
 
 return M

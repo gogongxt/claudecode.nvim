@@ -51,6 +51,14 @@ function M.disable()
   end
 end
 
+---Updates the server reference for selection tracking.
+---Used in multi-instance mode when switching between instances.
+---@param server table|nil The server object to use for communication.
+function M.update_server(server)
+  M.server = server
+  logger.debug("selection", "Server reference updated for selection tracking")
+end
+
 ---Creates autocommands for tracking selections.
 ---Sets up listeners for CursorMoved, CursorMovedI, ModeChanged, and TextChanged events.
 ---@local
@@ -443,6 +451,11 @@ function M.get_visual_selection()
 
   local start_coords, end_coords = get_selection_coordinates()
 
+  -- Debug: Log the raw coordinates
+  logger.debug("selection", "Raw selection coordinates:")
+  logger.debug("selection", "  start_coords: " .. vim.inspect(start_coords))
+  logger.debug("selection", "  end_coords: " .. vim.inspect(end_coords))
+
   local current_buf = vim.api.nvim_get_current_buf()
   local file_path = vim.api.nvim_buf_get_name(current_buf)
 
@@ -470,6 +483,11 @@ function M.get_visual_selection()
   end
 
   local lsp_positions = calculate_lsp_positions(start_coords, end_coords, visual_mode, lines_content)
+
+  -- Debug: Log the LSP positions
+  logger.debug("selection", "Calculated LSP positions:")
+  logger.debug("selection", "  start: " .. vim.inspect(lsp_positions.start))
+  logger.debug("selection", "  end: " .. vim.inspect(lsp_positions["end"]))
 
   return {
     text = final_text or "",
@@ -540,7 +558,41 @@ end
 ---Sends the selection update to the Claude server.
 ---@param selection table The selection object to send.
 function M.send_selection_update(selection)
-  M.server.broadcast("selection_changed", selection)
+  -- Try to get server from current active instance in multi-instance mode
+  local server = M.server
+  if not server then
+    -- Fallback to instance manager for multi-instance mode
+    local ok, instance_manager = pcall(require, "claudecode.instance_manager")
+    if ok then
+      local active_instance = instance_manager.get_active_instance()
+      if active_instance and active_instance.server then
+        server = active_instance.server
+        logger.debug("selection", "Using active instance server for selection update")
+      end
+    end
+  end
+
+  if server then
+    local message = {
+      jsonrpc = "2.0",
+      method = "selection_changed",
+      params = selection,
+    }
+
+    local json_message = vim.json.encode(message)
+    logger.debug("selection", "Sending selection update: " .. json_message)
+
+    -- Use the server's broadcast method for multi-instance compatibility
+    if server.broadcast then
+      server.broadcast("selection_changed", selection)
+    else
+      -- Fallback to direct TCP broadcast
+      local tcp_server = require("claudecode.server.tcp")
+      tcp_server.broadcast(server, json_message)
+    end
+  else
+    logger.debug("selection", "No server available for selection update")
+  end
 end
 
 ---Gets the latest recorded selection.
@@ -628,15 +680,50 @@ end
 ---@param line1 number|nil Optional start line for range-based selection
 ---@param line2 number|nil Optional end line for range-based selection
 function M.send_at_mention_for_visual_selection(line1, line2)
+  logger.debug("selection", "send_at_mention_for_visual_selection called with line1=" .. tostring(line1) .. ", line2=" .. tostring(line2))
+
   if not M.state.tracking_enabled then
-    logger.error("selection", "Selection tracking is not enabled.")
+    local msg = "Selection tracking is not enabled."
+    logger.error("selection", msg)
+    vim.notify(msg, vim.log.levels.ERROR)
     return false
   end
 
   -- Check if Claude Code integration is running (server may or may not have clients)
   local claudecode_main = require("claudecode")
-  if not claudecode_main.state.server then
-    logger.error("selection", "Claude Code integration is not running.")
+
+  -- Check server status using instance manager (always multi-instance mode now)
+  local server_available = false
+  local server_running = false
+  local client_count = 0
+
+  local ok, instance_manager = pcall(require, "claudecode.instance_manager")
+  if ok then
+    local active_instance = instance_manager.get_active_instance()
+    if active_instance and active_instance.server then
+      -- Check if the server is running (don't require clients for now)
+      local server_module = require("claudecode.server.init")
+      local status = server_module.get_multi_instance_status(active_instance.port)
+      server_running = status.running
+      client_count = status.client_count or 0
+      server_available = server_running -- Allow sending even if no clients yet
+
+      if server_available then
+        logger.debug("selection", "Server running with " .. client_count .. " clients")
+      else
+        logger.debug("selection", "Server not running")
+      end
+    else
+      logger.debug("selection", "No active instance or server")
+    end
+  else
+    logger.debug("selection", "Failed to load instance_manager")
+  end
+
+  if not server_available then
+    local msg = "Claude Code integration is not running."
+    logger.error("selection", msg)
+    vim.notify(msg, vim.log.levels.ERROR)
     return false
   end
 
@@ -644,25 +731,36 @@ function M.send_at_mention_for_visual_selection(line1, line2)
 
   -- If range parameters are provided, use them (for :'<,'> commands)
   if line1 and line2 then
+    logger.debug("selection", "Using range selection: " .. line1 .. "-" .. line2)
     sel_to_send = M.get_range_selection(line1, line2)
     if not sel_to_send or sel_to_send.selection.isEmpty then
-      logger.warn("selection", "Invalid range selection to send as at-mention.")
+      local msg = "Invalid range selection to send as at-mention."
+      logger.warn("selection", msg)
+      vim.notify(msg, vim.log.levels.WARN)
       return false
     end
+    logger.debug("selection", "Range selection obtained successfully")
   else
+    logger.debug("selection", "No range provided, checking tracked selection")
     -- Use existing logic for visual mode or tracked selection
     sel_to_send = M.state.latest_selection
 
     if not sel_to_send or sel_to_send.selection.isEmpty then
+      logger.debug("selection", "No tracked selection, trying to get current visual selection")
       -- Fallback: try to get current visual selection directly.
       -- This helps if latest_selection was demoted or command was too fast.
       local current_visual = M.get_visual_selection()
       if current_visual and not current_visual.selection.isEmpty then
         sel_to_send = current_visual
+        logger.debug("selection", "Found current visual selection")
       else
-        logger.warn("selection", "No visual selection to send as at-mention.")
+        local msg = "No visual selection to send as at-mention."
+        logger.warn("selection", msg)
+        vim.notify(msg, vim.log.levels.WARN)
         return false
       end
+    else
+      logger.debug("selection", "Using tracked selection")
     end
   end
 
@@ -685,15 +783,34 @@ function M.send_at_mention_for_visual_selection(line1, line2)
   local start_line = sel_to_send.selection.start.line -- Already 0-indexed from selection module
   local end_line = sel_to_send.selection["end"].line -- Already 0-indexed
 
-  local success, error_msg = claudecode_main.send_at_mention(file_path, start_line, end_line, "ClaudeCodeSend")
+  -- In multi-instance mode, let send_at_mention figure out the active instance
+  -- by passing nil, which forces it to use the current active instance
+  -- This avoids race conditions where the active instance might change between
+  -- our check and the actual send
+  logger.info("selection", "Sending to current active instance (auto-detected), passing nil instance")
+
+  -- Get connection status for better user feedback (use previously calculated values)
+  local is_connected = server_running and client_count > 0
+
+  local success, error_msg = claudecode_main.send_at_mention(file_path, start_line, end_line, "ClaudeCodeSend", nil)
 
   if success then
+    local msg = "Selection sent to Claude Code"
+    if is_connected then
+      msg = msg .. " (Claude is connected)"
+    else
+      msg = msg .. " (waiting for Claude to connect)"
+    end
     logger.debug("selection", "Visual selection sent as at-mention.")
-
+    vim.notify(msg, vim.log.levels.INFO)
     return true
   else
-    logger.error("selection", "Failed to send at-mention: " .. (error_msg or "unknown error"))
+    local msg = "Failed to send at-mention: " .. (error_msg or "unknown error")
+    logger.error("selection", msg)
+    vim.notify(msg, vim.log.levels.ERROR)
     return false
   end
 end
+
+
 return M

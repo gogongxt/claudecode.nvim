@@ -59,6 +59,19 @@ function M.get_active_bufnr()
   return nil
 end
 
+---Set the current instance ID for multi-instance support
+---@param instance_id number The instance number
+function M.set_current_instance(instance_id)
+  -- No-op provider doesn't manage terminals, but we set the environment
+  -- variable for completeness in multi-instance mode
+  vim.fn.setenv("CLAUDE_INSTANCE_ID", "claude_" .. instance_id)
+end
+
+---Hide terminal window but keep process running (for multi-instance support)
+function M.hide_window()
+  -- No-op provider doesn't manage terminals
+end
+
 ---Provider availability (always true; explicit opt-in required)
 ---@return boolean
 function M.is_available()

@@ -7,18 +7,44 @@ local M = {}
 
 local logger = require("claudecode.logger")
 
-local jobid = nil
+-- Multi-instance support: maintain separate jobs for each instance
+local jobs = {} -- instance_id -> jobid
+
 ---@type ClaudeCodeTerminalConfig
 local config
 
-local function cleanup_state()
-  jobid = nil
+local function cleanup_state(instance_id)
+  jobs[instance_id] = nil
 end
 
-local function is_valid()
+local function is_valid(instance_id)
   -- For external terminals, we only track if we have a running job
   -- We don't manage terminal windows since they're external
-  return jobid and jobid > 0
+  return jobs[instance_id] and jobs[instance_id] > 0
+end
+
+-- Get current instance ID from environment or buffer
+local function get_instance_id()
+  local instance_id = 1 -- default
+  local env_instance_ok, env_instance = pcall(vim.fn.getenv, "CLAUDE_INSTANCE_ID")
+  if env_instance_ok and env_instance and type(env_instance) == "string" and env_instance ~= "" then
+    local match = env_instance:match("claude_(%d+)")
+    if match then
+      instance_id = tonumber(match)
+    end
+  end
+
+  -- Also check current buffer for instance marker
+  local current_buf = vim.api.nvim_get_current_buf()
+  local ok, buf_instance = pcall(vim.api.nvim_buf_get_var, current_buf, "claude_instance")
+  if ok and buf_instance then
+    -- Only use buffer instance if it's different from environment and environment is default (1)
+    if not env_instance_ok or not env_instance or env_instance == "" then
+      instance_id = buf_instance
+    end
+  end
+
+  return instance_id
 end
 
 ---@param term_config ClaudeCodeTerminalConfig
@@ -29,10 +55,13 @@ end
 ---@param cmd_string string
 ---@param env_table table
 function M.open(cmd_string, env_table)
-  if is_valid() then
+  local instance_id = get_instance_id()
+  logger.debug("terminal", "M.open called for instance " .. instance_id .. " (env: " .. (env_table.CLAUDE_CODE_SSE_PORT or "nil") .. ")")
+
+  if is_valid(instance_id) then
     -- External terminal is already running, we can't focus it programmatically
     -- Just log that it's already running
-    logger.debug("terminal", "External Claude terminal is already running")
+    logger.debug("terminal", "External Claude terminal is already running for instance " .. instance_id)
     return
   end
 
@@ -119,31 +148,36 @@ function M.open(cmd_string, env_table)
   -- Set cwd for jobstart when available to improve robustness even if the terminal ignores it
   cwd_for_jobstart = cwd_for_jobstart or (vim.fn.getcwd and vim.fn.getcwd() or nil)
 
-  jobid = vim.fn.jobstart(cmd_parts, {
+  jobs[instance_id] = vim.fn.jobstart(cmd_parts, {
     detach = true,
     env = env_table,
     cwd = cwd_for_jobstart,
     on_exit = function(job_id, exit_code, _)
       vim.schedule(function()
-        if job_id == jobid then
-          cleanup_state()
+        if job_id == jobs[instance_id] then
+          cleanup_state(instance_id)
         end
       end)
     end,
   })
 
-  if not jobid or jobid <= 0 then
+  if not jobs[instance_id] or jobs[instance_id] <= 0 then
     vim.notify("Failed to start external terminal with command: " .. full_command, vim.log.levels.ERROR)
-    cleanup_state()
+    cleanup_state(instance_id)
     return
   end
+
+  logger.info("terminal", "Started external terminal for instance " .. instance_id .. " with job ID: " .. jobs[instance_id])
 end
 
 function M.close()
-  if is_valid() then
+  local instance_id = get_instance_id()
+  if is_valid(instance_id) then
     -- Try to stop the job gracefully
-    vim.fn.jobstop(jobid)
-    cleanup_state()
+    local job_id = jobs[instance_id]
+    logger.debug("terminal", "Closing external terminal for instance " .. instance_id .. " (job ID: " .. job_id .. ")")
+    vim.fn.jobstop(job_id)
+    cleanup_state(instance_id)
   end
 end
 
@@ -152,12 +186,15 @@ end
 ---@param env_table table
 ---@param effective_config table
 function M.simple_toggle(cmd_string, env_table, effective_config)
-  if is_valid() then
+  local instance_id = get_instance_id()
+  if is_valid(instance_id) then
     -- External terminal is running, stop it
+    logger.debug("terminal", "Simple toggle: stopping external terminal for instance " .. instance_id)
     M.close()
   else
     -- Start external terminal
-    M.open(cmd_string, env_table, effective_config, true)
+    logger.debug("terminal", "Simple toggle: starting external terminal for instance " .. instance_id)
+    M.open(cmd_string, env_table, effective_config)
   end
 end
 
@@ -168,6 +205,8 @@ end
 function M.focus_toggle(cmd_string, env_table, effective_config)
   -- For external terminals, focus toggle behaves the same as simple toggle
   -- since we can't detect or control focus of external windows
+  local instance_id = get_instance_id()
+  logger.debug("terminal", "Focus toggle: delegating to simple toggle for instance " .. instance_id)
   M.simple_toggle(cmd_string, env_table, effective_config)
 end
 
@@ -188,6 +227,22 @@ end
 --- No-op function for external terminals since we can't ensure visibility of external windows
 function M.ensure_visible() end
 
+---Set the current instance ID for multi-instance support
+---@param instance_id number The instance number
+function M.set_current_instance(instance_id)
+  -- Set environment variable for child processes
+  vim.fn.setenv("CLAUDE_INSTANCE_ID", "claude_" .. instance_id)
+  logger.debug("terminal", "Set current instance to " .. instance_id .. " (External provider)")
+end
+
+---Hide terminal window but keep process running (for multi-instance support)
+function M.hide_window()
+  -- External terminals cannot be hidden, so this is a no-op
+  -- The external terminal process continues running independently
+  local instance_id = get_instance_id()
+  logger.debug("terminal", "Hide window called for instance " .. instance_id .. " (no-op for external provider)")
+end
+
 ---@return boolean
 function M.is_available()
   -- Availability is checked by terminal.lua before this provider is selected
@@ -197,10 +252,23 @@ end
 ---@return table?
 function M._get_terminal_for_test()
   -- For testing purposes, return job info if available
-  if is_valid() then
-    return { jobid = jobid }
+  local instance_id = get_instance_id()
+  if is_valid(instance_id) then
+    return { jobid = jobs[instance_id], instance_id = instance_id }
   end
   return nil
+end
+
+---Clean up all terminal instances (for shutdown)
+function M._cleanup_all()
+  local logger = require("claudecode.logger")
+  for instance_id, job_id in pairs(jobs) do
+    if job_id and job_id > 0 then
+      logger.debug("terminal", "Stopping external terminal job for instance " .. instance_id .. " (job ID: " .. job_id .. ")")
+      vim.fn.jobstop(job_id)
+    end
+  end
+  jobs = {}
 end
 
 return M

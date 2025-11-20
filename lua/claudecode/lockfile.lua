@@ -150,6 +150,83 @@ function M.create(port, auth_token)
   return true, lock_path, auth_token
 end
 
+---Create a lock file for a specific instance
+---@param port number The port number for the WebSocket server
+---@param auth_token string The authentication token
+---@param instance_name string The instance identifier
+---@return boolean success Whether the operation was successful
+---@return string result_or_error The lock file path if successful, or error message if failed
+function M.create_instance(port, auth_token, instance_name)
+  if not port or type(port) ~= "number" then
+    return false, "Invalid port number"
+  end
+
+  if not auth_token or type(auth_token) ~= "string" then
+    return false, "Invalid auth token"
+  end
+
+  if not instance_name or type(instance_name) ~= "string" then
+    return false, "Invalid instance name"
+  end
+
+  if port < 1 or port > 65535 then
+    return false, "Port number out of valid range (1-65535): " .. tostring(port)
+  end
+
+  local ok, err = pcall(function()
+    return vim.fn.mkdir(M.lock_dir, "p")
+  end)
+
+  if not ok then
+    return false, "Failed to create lock directory: " .. (err or "unknown error")
+  end
+
+  -- Create instance-specific lock file name
+  local lock_path = M.lock_dir .. "/" .. port .. "_" .. instance_name .. ".lock"
+
+  local workspace_folders = M.get_workspace_folders()
+
+  -- Prepare lock file content with instance information
+  local lock_content = {
+    pid = vim.fn.getpid(),
+    workspaceFolders = workspace_folders,
+    ideName = "Neovim",
+    transport = "ws",
+    authToken = auth_token,
+    instanceName = instance_name,  -- Add instance identifier
+    multiInstance = true,         -- Mark as multi-instance
+  }
+
+  local json
+  local ok_json, json_err = pcall(function()
+    json = vim.json.encode(lock_content)
+    return json
+  end)
+
+  if not ok_json or not json then
+    return false, "Failed to encode lock file content: " .. (json_err or "unknown error")
+  end
+
+  local file = io.open(lock_path, "w")
+  if not file then
+    return false, "Failed to create instance lock file: " .. lock_path
+  end
+
+  local write_ok, write_err = pcall(function()
+    file:write(json)
+    file:close()
+  end)
+
+  if not write_ok then
+    pcall(function()
+      file:close()
+    end)
+    return false, "Failed to write instance lock file: " .. (write_err or "unknown error")
+  end
+
+  return true, lock_path
+end
+
 ---Remove the lock file for the given port
 ---@param port number The port number of the WebSocket server
 ---@return boolean success Whether the operation was successful
@@ -171,6 +248,37 @@ function M.remove(port)
 
   if not ok then
     return false, "Failed to remove lock file: " .. (err or "unknown error")
+  end
+
+  return true
+end
+
+---Remove the lock file for a specific instance
+---@param port number The port number of the WebSocket server
+---@param instance_name string The instance identifier
+---@return boolean success Whether the operation was successful
+---@return string? error Error message if operation failed
+function M.remove_instance(port, instance_name)
+  if not port or type(port) ~= "number" then
+    return false, "Invalid port number"
+  end
+
+  if not instance_name or type(instance_name) ~= "string" then
+    return false, "Invalid instance name"
+  end
+
+  local lock_path = M.lock_dir .. "/" .. port .. "_" .. instance_name .. ".lock"
+
+  if vim.fn.filereadable(lock_path) == 0 then
+    return false, "Instance lock file does not exist: " .. lock_path
+  end
+
+  local ok, err = pcall(function()
+    return os.remove(lock_path)
+  end)
+
+  if not ok then
+    return false, "Failed to remove instance lock file: " .. (err or "unknown error")
   end
 
   return true

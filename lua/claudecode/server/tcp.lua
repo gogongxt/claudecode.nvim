@@ -1,6 +1,7 @@
 ---@brief TCP server implementation using vim.loop
 local client_manager = require("claudecode.server.client")
 local utils = require("claudecode.server.utils")
+local logger = require("claudecode.logger")
 
 local M = {}
 
@@ -55,9 +56,17 @@ end
 ---@return TCPServer|nil server The server object, or nil on error
 ---@return string|nil error Error message if failed
 function M.create_server(config, callbacks, auth_token)
-  local port = M.find_available_port(config.port_range.min, config.port_range.max)
-  if not port then
-    return nil, "No available ports in range " .. config.port_range.min .. "-" .. config.port_range.max
+  local port
+  if config.port then
+    -- Use specified port
+    port = config.port
+    logger.debug("tcp_server", "Using specified port:", port)
+  else
+    -- Find available port in range
+    port = M.find_available_port(config.port_range.min, config.port_range.max)
+    if not port then
+      return nil, "No available ports in range " .. config.port_range.min .. "-" .. config.port_range.max
+    end
   end
 
   local tcp_server = vim.loop.new_tcp()
@@ -185,7 +194,20 @@ end
 ---@param server TCPServer The server object
 ---@param message string The message to broadcast
 function M.broadcast(server, message)
-  for _, client in pairs(server.clients) do
+  if not server or not server.clients then
+    logger.debug("tcp_server", "Broadcast failed: no server or clients")
+    return
+  end
+
+  local client_count = 0
+  for _ in pairs(server.clients) do
+    client_count = client_count + 1
+  end
+
+  logger.debug("tcp_server", "Broadcasting message to " .. client_count .. " clients")
+
+  for client_id, client in pairs(server.clients) do
+    logger.debug("tcp_server", "Sending to client: " .. tostring(client_id))
     client_manager.send_message(client, message)
   end
 end
@@ -194,6 +216,10 @@ end
 ---@param server TCPServer The server object
 ---@return number count Number of connected clients
 function M.get_client_count(server)
+  if not server or not server.clients then
+    return 0
+  end
+
   local count = 0
   for _ in pairs(server.clients) do
     count = count + 1
@@ -205,6 +231,10 @@ end
 ---@param server TCPServer The server object
 ---@return table clients Array of client information
 function M.get_clients_info(server)
+  if not server or not server.clients then
+    return {}
+  end
+
   local clients = {}
   for _, client in pairs(server.clients) do
     table.insert(clients, client_manager.get_client_info(client))

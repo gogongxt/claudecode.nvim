@@ -29,10 +29,16 @@ When Anthropic released Claude Code, they only supported VS Code and JetBrains. 
   config = true,
   keys = {
     { "<leader>a", nil, desc = "AI/Claude Code" },
-    { "<leader>ac", "<cmd>ClaudeCode<cr>", desc = "Toggle Claude" },
-    { "<leader>af", "<cmd>ClaudeCodeFocus<cr>", desc = "Focus Claude" },
-    { "<leader>ar", "<cmd>ClaudeCode --resume<cr>", desc = "Resume Claude" },
-    { "<leader>aC", "<cmd>ClaudeCode --continue<cr>", desc = "Continue Claude" },
+    -- Fixed instance shortcuts - each key maps to a specific instance
+    { "<leader>a1", "<cmd>ClaudeCodeInstance 1<cr>", desc = "Toggle Claude instance 1" },
+    { "<leader>a2", "<cmd>ClaudeCodeInstance 2<cr>", desc = "Toggle Claude instance 2" },
+    { "<leader>a3", "<cmd>ClaudeCodeInstance 3<cr>", desc = "Toggle Claude instance 3" },
+    { "<leader>a4", "<cmd>ClaudeCodeInstance 4<cr>", desc = "Toggle Claude instance 4" },
+    { "<leader>a5", "<cmd>ClaudeCodeInstance 5<cr>", desc = "Toggle Claude instance 5" },
+    -- General commands
+    { "<leader>af", "<cmd>ClaudeCodeFocus<cr>", desc = "Focus Claude (instance 1)" },
+    { "<leader>ar1", "<cmd>ClaudeCodeInstance 1 --resume<cr>", desc = "Resume Claude (instance 1)" },
+    { "<leader>aC1", "<cmd>ClaudeCodeInstance 1 --continue<cr>", desc = "Continue Claude (instance 1)" },
     { "<leader>am", "<cmd>ClaudeCodeSelectModel<cr>", desc = "Select Claude model" },
     { "<leader>ab", "<cmd>ClaudeCodeAdd %<cr>", desc = "Add current buffer" },
     { "<leader>as", "<cmd>ClaudeCodeSend<cr>", mode = "v", desc = "Send to Claude" },
@@ -261,7 +267,7 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
     terminal = {
       split_side = "right", -- "left" or "right"
       split_width_percentage = 0.30,
-      provider = "auto", -- "auto", "snacks", "native", "external", "none", or custom provider table
+      provider = "auto", -- "auto", "toggleterm", "snacks", "native", "external", "none", or custom provider table
       auto_close = true,
       snacks_win_opts = {}, -- Opts to pass to `Snacks.terminal.open()` - see Floating Window section below
 
@@ -547,6 +553,33 @@ Run Claude Code in a separate terminal application outside of Neovim:
   },
 }
 ```
+
+### Toggleterm Provider
+
+Use [akinsho/toggleterm.nvim](https://github.com/akinsho/toggleterm.nvim) for terminal management:
+
+```lua
+{
+  "coder/claudecode.nvim",
+  dependencies = { "akinsho/toggleterm.nvim" },
+  opts = {
+    terminal = {
+      provider = "toggleterm", -- or "auto" to try toggleterm first
+      split_side = "right",    -- "left" or "right"
+      split_width_percentage = 0.30,
+    },
+  },
+}
+```
+
+The toggleterm provider automatically:
+- Creates vertical split terminals with proper sizing
+- Supports left/right positioning
+- Handles terminal focus and smart toggling
+- Integrates with multi-instance support
+- Provides keymaps (Ctrl+/ for ESC in terminal mode)
+
+**Note:** When using `provider = "auto"`, toggleterm will be tried first before falling back to snacks.nvim, then native terminal.
 
 ### Custom Terminal Providers
 
