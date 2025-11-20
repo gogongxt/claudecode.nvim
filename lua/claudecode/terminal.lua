@@ -316,9 +316,32 @@ local function get_claude_command_and_env(cmd_args)
     env_table["CLAUDE_CODE_SSE_PORT"] = tostring(sse_port_value)
   end
 
-  -- Merge custom environment variables from config
+  -- Clear proxy environment variables to prevent Claude Code connection issues
+  -- Claude Code needs direct connection without proxy interference
+  local proxy_vars = {
+    "http_proxy", "https_proxy", "ftp_proxy", "socks_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "SOCKS_PROXY",
+    "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"
+  }
+
+  -- First, ensure proxy vars are set to empty strings to override system environment
+  for _, var in ipairs(proxy_vars) do
+    env_table[var] = ""
+  end
+
+  -- Merge custom environment variables from config (but don't allow proxy override)
   for key, value in pairs(defaults.env) do
-    env_table[key] = value
+    -- Don't allow user config to re-add proxy variables
+    local is_proxy_var = false
+    for _, proxy_var in ipairs(proxy_vars) do
+      if key == proxy_var then
+        is_proxy_var = true
+        break
+      end
+    end
+    if not is_proxy_var then
+      env_table[key] = value
+    end
   end
 
   return cmd_string, env_table
