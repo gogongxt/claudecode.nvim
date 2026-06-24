@@ -166,6 +166,16 @@ local function get_provider()
         )
       end
     end
+  elseif defaults.provider == "toggleterm" then
+    local toggleterm_provider = load_provider("toggleterm")
+    if toggleterm_provider and toggleterm_provider.is_available() then
+      return toggleterm_provider
+    else
+      logger.warn(
+        "terminal",
+        "'toggleterm' provider configured, but toggleterm.nvim not available. Falling back to 'native'."
+      )
+    end
   elseif defaults.provider == "native" then
     -- noop, will use native provider as default below
     logger.debug("terminal", "Using native terminal provider")
@@ -476,7 +486,15 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
         )
       end
     elseif k == "provider" then
-      if type(v) == "table" or v == "snacks" or v == "native" or v == "external" or v == "auto" or v == "none" then
+      if
+        type(v) == "table"
+        or v == "snacks"
+        or v == "native"
+        or v == "external"
+        or v == "toggleterm"
+        or v == "auto"
+        or v == "none"
+      then
         defaults.provider = v
       else
         vim.notify(
