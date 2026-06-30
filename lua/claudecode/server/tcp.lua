@@ -198,9 +198,17 @@ function M._handle_new_connection(server)
   -- Set up data handler
   client_tcp:read_start(function(err, data)
     if err then
-      local error_msg = "Client read error: " .. err
-      server.on_error(error_msg)
-      M._disconnect_client(server, client, 1006, error_msg)
+      -- ECONNRESET / ECONNABORTED / EPIPE / EOF are the client disconnecting
+      -- (Claude CLI exited, crashed, or network dropped). These are expected
+      -- connection-lifecycle events, not server errors — log at debug and
+      -- route through the normal disconnect path so on_disconnect cleans up
+      -- the session binding. Only unexpected read errors surface to on_error.
+      if err == "EOF" or err == "ECONNRESET" or err == "ECONNABORTED" or err == "EPIPE" then
+        require("claudecode.logger").debug("server", "Client disconnected (read_start): " .. err)
+      else
+        server.on_error("Client read error: " .. err)
+      end
+      M._disconnect_client(server, client, 1006, "Client read error: " .. err)
       return
     end
 

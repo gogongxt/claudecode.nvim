@@ -759,6 +759,10 @@ local vim = {
     end
   end,
 
+  empty_dict = function(t)
+    return t or {}
+  end,
+
   json = {
     encode = function(data)
       -- Extremely simplified JSON encoding, sufficient for basic test cases.

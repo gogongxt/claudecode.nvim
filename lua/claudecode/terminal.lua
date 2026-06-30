@@ -26,12 +26,30 @@ local defaults = {
   cwd = nil, -- static cwd override
   git_repo_cwd = false, -- resolve to git root when spawning
   cwd_provider = nil, -- function(ctx) -> cwd string
+  -- Session tab bar: shows one label per Claude session in the terminal
+  -- window, click to switch. Driven by window_manager + the global session
+  -- list (sessions are not scoped to tabpages).
+  -- Keymaps default to false (unset) so terminal-native keys like <Tab>, <S-Tab>,
+  -- <C-w> pass through to the TUI untouched — matching plain toggleterm behavior.
+  -- Set any to a key string (e.g. "<C-Tab>") to opt in.
+  tabs = {
+    enabled = true,
+    show_close_button = true,
+    show_new_button = true,
+    keymaps = { next_tab = false, prev_tab = false, new_tab = false, close_tab = false },
+  },
 }
 
 M.defaults = defaults
 
 -- Lazy load providers
 local providers = {}
+
+-- Buffer -> session_id map for terminals owned by a session. Lets the server
+-- resolve which session an incoming selection/tool call belongs to, and lets
+-- the terminal module find a session from the buffer currently in a window.
+---@type table<number, string>
+local buffer_session_map = {}
 
 ---Loads a terminal provider module
 ---@param provider_name string The name of the provider to load
@@ -204,6 +222,133 @@ local function get_provider()
     error("ClaudeCode: Critical error - native terminal provider failed to load")
   end
   return native_provider
+end
+
+-- Multi-session is opt-in per provider: one that implements open_session /
+-- close_session / focus_session / get_session_bufnr / close_session_keep_window
+-- / register_terminal_for_session drives per-session terminals. Providers
+-- without those (legacy snacks/native/external/none) keep single-terminal
+-- behavior; we still track an "active" session for mention routing.
+local session_manager_mod = require("claudecode.session")
+
+---Register a terminal buffer as belonging to a session.
+---@param bufnr number
+---@param session_id string
+function M.register_buffer_session(bufnr, session_id)
+  if bufnr and session_id then
+    buffer_session_map[bufnr] = session_id
+  end
+end
+
+---Unregister a terminal buffer's session binding.
+---@param bufnr number
+function M.unregister_buffer_session(bufnr)
+  buffer_session_map[bufnr] = nil
+end
+
+---Look up the session id bound to a terminal buffer.
+---@param bufnr number
+---@return string|nil session_id
+function M.get_session_for_buffer(bufnr)
+  return buffer_session_map[bufnr]
+end
+
+---Find the session whose terminal buffer is currently displayed in some window
+---(i.e. the foreground terminal). Used by the server to bind an incoming
+---Claude CLI client to the session whose terminal was just spawned/shown,
+---rather than "most recently created" (which races with placeholder sessions).
+---@return string|nil session_id
+function M.get_visible_session_id()
+  for _, win in ipairs(vim.api.nvim_list_wins() or {}) do
+    local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+    if ok and buf then
+      local sid = buffer_session_map[buf]
+      if sid then
+        return sid
+      end
+    end
+  end
+  return nil
+end
+
+---Bind a freshly opened terminal buffer to its session and record terminal info.
+---Called by the session-aware entry points after the provider opens a terminal.
+---@param session_id string
+---@param bufnr number
+---@param provider table The provider instance (may expose register_terminal_for_session)
+local function finalize_session_terminal(session_id, bufnr, provider)
+  if not (session_id and bufnr) then
+    return
+  end
+  M.register_buffer_session(bufnr, session_id)
+  if provider and provider.register_terminal_for_session then
+    provider.register_terminal_for_session(session_id, bufnr)
+  end
+  local sm = session_manager_mod
+  sm.update_terminal_info(session_id, { bufnr = bufnr })
+  -- Mark awaiting_handshake only if not already bound — toggling an
+  -- already-connected session must not flip it back, or the next handshake
+  -- from a different session would steal this session's identity.
+  local s = sm.get_session(session_id)
+  if s and not s.client_id and sm.mark_awaiting_handshake then
+    sm.mark_awaiting_handshake(session_id)
+  end
+  -- Re-render the tabbar: providers call attach_tabbar before finalize, so
+  -- the initial render missed this session's buffer binding.
+  pcall(function()
+    local tabbar = require("claudecode.terminal.tabbar")
+    if tabbar.is_visible and tabbar.is_visible() then
+      local ok_tab, current_tab = pcall(vim.api.nvim_get_current_tabpage)
+      if ok_tab and current_tab then
+        tabbar.render(current_tab)
+      end
+    end
+  end)
+end
+
+function M.ensure_session()
+  return session_manager_mod.ensure_session()
+end
+
+function M.get_active_session_id()
+  return session_manager_mod.get_active_session_id()
+end
+
+-- Get the session id whose terminal buffer is currently focused, if any.
+function M.get_current_session_id()
+  local session = session_manager_mod.find_session_by_bufnr(vim.api.nvim_get_current_buf())
+  return session and session.id or nil
+end
+
+---@return boolean has_open_session Whether the provider exposes per-session terminals.
+local function provider_has_sessions(provider)
+  return provider and type(provider.open_session) == "function"
+end
+
+function M.list_sessions()
+  return session_manager_mod.list_sessions()
+end
+
+-- Called by providers.
+function M.update_session_terminal_info(session_id, terminal_info)
+  session_manager_mod.update_terminal_info(session_id, terminal_info)
+end
+
+-- Rename a session (defaults to the active one). Empty/whitespace names rejected.
+---@return boolean success
+function M.rename_session(session_id, name)
+  local sm = session_manager_mod
+  session_id = session_id or sm.get_active_session_id()
+  if not session_id then
+    return false
+  end
+  name = type(name) == "string" and vim.trim(name) or ""
+  if name == "" then
+    require("claudecode.logger").warn("terminal", "rename_session: empty name rejected")
+    return false
+  end
+  sm.update_session_name(session_id, name)
+  return true
 end
 
 ---Builds the effective terminal configuration by merging defaults with overrides
@@ -422,8 +567,19 @@ local function ensure_terminal_visible_no_focus(opts_override, cmd_args)
   -- Terminal is not visible, open it without focus
   local effective_config = build_config(opts_override)
   local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  local session_id = M.ensure_session()
 
-  provider.open(cmd_string, claude_env_table, effective_config, false) -- false = don't focus
+  if provider_has_sessions(provider) then
+    provider.open_session(session_id, cmd_string, claude_env_table, effective_config, false)
+    finalize_session_terminal(
+      session_id,
+      provider.get_session_bufnr and provider.get_session_bufnr(session_id),
+      provider
+    )
+  else
+    provider.open(cmd_string, claude_env_table, effective_config, false) -- false = don't focus
+    finalize_session_terminal(session_id, provider.get_active_bufnr(), provider)
+  end
   return true
 end
 
@@ -562,6 +718,12 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
           vim.log.levels.WARN
         )
       end
+    elseif k == "tabs" then
+      if type(v) == "table" then
+        defaults.tabs = vim.tbl_deep_extend("force", defaults.tabs, v)
+      else
+        vim.notify("claudecode.terminal.setup: Invalid value for tabs (expected table)", vim.log.levels.WARN)
+      end
     elseif k == "cwd" then
       if v == nil or type(v) == "string" then
         defaults.cwd = v
@@ -601,18 +763,72 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
   -- Setup providers with config
   get_provider().setup(defaults)
 
+  -- Single-window-multi-buffer infra: window_manager owns THE global terminal
+  -- window (singleton across all tabpages); providers create per-session
+  -- buffers and swap them via display_buffer. tabbar renders the global
+  -- session list. pcall-guarded so minimal test stubs without a full vim.api
+  -- still load the terminal module.
+  pcall(function()
+    require("claudecode.terminal.window_manager").setup(defaults)
+  end)
+  pcall(function()
+    require("claudecode.terminal.tabbar").setup(defaults.tabs or { enabled = true })
+  end)
+
   -- Streamed-paste compatibility shim for #161 (no-op on Neovim >= 0.12.2).
   require("claudecode.terminal.paste_fix").apply(defaults.fix_streamed_paste)
 end
 
----Opens or focuses the Claude terminal.
----@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
----@param cmd_args string? Arguments to append to the claude command.
-function M.open(opts_override, cmd_args)
+-- Common backend for open/simple_toggle/focus_toggle. `session_method` is the
+-- provider method to call on session-aware providers ("open_session" or
+-- "toggle_session"); `legacy_method` is the fallback for non-session providers.
+-- `focus` is forwarded to open_session; toggle_session takes none.
+local function run_terminal_action(opts_override, cmd_args, session_method, legacy_method, focus)
   local effective_config = build_config(opts_override)
+  local provider = get_provider()
+  local session_id = M.ensure_session()
+
+  -- Spawn-time args (--resume, --continue, --model, …) only take effect on a
+  -- fresh `claude` process; open_session/toggle_session short-circuit when the
+  -- session already has a live buffer and would silently drop cmd_args. When
+  -- cmd_args is non-empty AND the active session already has a terminal, open a
+  -- brand-new session with those args instead of toggling the existing one.
+  -- Without this, `:ClaudeCode --resume <id>` toggles the live session and
+  -- never passes --resume to claude (issue introduced by multi-session).
+  local has_args = cmd_args ~= nil and cmd_args ~= ""
+  if
+    has_args
+    and provider_has_sessions(provider)
+    and provider.get_session_bufnr
+    and provider.get_session_bufnr(session_id) ~= nil
+  then
+    M.open_new_session(opts_override, cmd_args)
+    return
+  end
+
   local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
 
-  get_provider().open(cmd_string, claude_env_table, effective_config)
+  if provider_has_sessions(provider) then
+    if session_method == "toggle_session" and provider.toggle_session then
+      provider.toggle_session(session_id, effective_config, cmd_string, claude_env_table)
+    else
+      provider.open_session(session_id, cmd_string, claude_env_table, effective_config, focus)
+    end
+    finalize_session_terminal(
+      session_id,
+      provider.get_session_bufnr and provider.get_session_bufnr(session_id),
+      provider
+    )
+    return
+  end
+
+  provider[legacy_method](cmd_string, claude_env_table, effective_config)
+  finalize_session_terminal(session_id, provider.get_active_bufnr(), provider)
+end
+
+---Opens or focuses the Claude terminal.
+function M.open(opts_override, cmd_args)
+  run_terminal_action(opts_override, cmd_args, "open_session", "open", true)
 end
 
 ---Closes the managed Claude terminal if it's open and valid.
@@ -621,23 +837,184 @@ function M.close()
 end
 
 ---Simple toggle: always show/hide the Claude terminal regardless of focus.
----@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
----@param cmd_args string? Arguments to append to the claude command.
 function M.simple_toggle(opts_override, cmd_args)
-  local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
-
-  get_provider().simple_toggle(cmd_string, claude_env_table, effective_config)
+  run_terminal_action(opts_override, cmd_args, "toggle_session", "simple_toggle", false)
 end
 
 ---Smart focus toggle: switches to terminal if not focused, hides if currently focused.
----@param opts_override table (optional) Overrides for terminal appearance (split_side, split_width_percentage).
----@param cmd_args string|nil (optional) Arguments to append to the claude command.
 function M.focus_toggle(opts_override, cmd_args)
-  local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  run_terminal_action(opts_override, cmd_args, "open_session", "focus_toggle", true)
+end
 
-  get_provider().focus_toggle(cmd_string, claude_env_table, effective_config)
+-- Open a brand-new Claude terminal session and focus it. For legacy providers
+-- this behaves like M.open.
+function M.open_new_session(opts_override, cmd_args)
+  local effective_config = build_config(opts_override)
+  local provider = get_provider()
+
+  if not provider_has_sessions(provider) then
+    M.open(opts_override, cmd_args)
+    return
+  end
+
+  local sm = session_manager_mod
+  -- Create + activate the new session BEFORE building the env, so the env
+  -- carries THIS session's identity (not the previous active session's).
+  local session_id = sm.create_session()
+  sm.set_active_session(session_id)
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  provider.open_session(session_id, cmd_string, claude_env_table, effective_config, true)
+  finalize_session_terminal(session_id, provider.get_session_bufnr and provider.get_session_bufnr(session_id), provider)
+end
+
+-- Switch the active session to `session_id` and focus its terminal.
+function M.switch_to_session(session_id, opts_override)
+  local sm = session_manager_mod
+  if not sm.get_session(session_id) then
+    require("claudecode.logger").warn("terminal", "Cannot switch to non-existent session: " .. tostring(session_id))
+    return
+  end
+
+  sm.set_active_session(session_id)
+  local provider = get_provider()
+
+  if provider.focus_session then
+    provider.focus_session(session_id, build_config(opts_override))
+  else
+    M.open(opts_override, nil)
+  end
+end
+
+-- Toggle a session's terminal visibility (toggleterm-style). For providers
+-- without per-session toggle_session, delegate to simple_toggle so the
+-- legacy provider's own show/hide semantics apply — NOT M.open, which only
+-- ever shows and would make "toggle" a no-op on the second call.
+function M.toggle_session(session_id, opts_override)
+  local sm = session_manager_mod
+  if not sm.get_session(session_id) then
+    require("claudecode.logger").warn("terminal", "Cannot toggle non-existent session: " .. tostring(session_id))
+    return
+  end
+
+  sm.set_active_session(session_id)
+  local provider = get_provider()
+  local effective_config = build_config(opts_override)
+  local cmd_string, claude_env_table = get_claude_command_and_env(nil)
+
+  if provider.toggle_session then
+    provider.toggle_session(session_id, effective_config, cmd_string, claude_env_table)
+  else
+    -- Legacy single-terminal provider: route through its simple_toggle so the
+    -- window actually hides when already visible. M.open would only ever show.
+    provider.simple_toggle(cmd_string, claude_env_table, effective_config)
+  end
+
+  -- Bind the session so the tabbar lists it. toggle_session_by_index creates
+  -- placeholder sessions without a terminal; provider.toggle_session may spawn
+  -- one on first open.
+  finalize_session_terminal(session_id, provider.get_session_bufnr and provider.get_session_bufnr(session_id), provider)
+end
+
+-- Toggle the session at a 1-based slot index. If the slot is occupied, toggle
+-- that session; if empty, create a new session pinned to slot N.
+function M.toggle_session_by_index(n, opts_override)
+  local sm = session_manager_mod
+  if type(n) ~= "number" or n < 1 then
+    return
+  end
+
+  local existing = sm.get_session_by_slot(n)
+  local session_id
+  if existing then
+    session_id = existing.id
+  else
+    session_id = sm.create_session({ slot = n })
+    sm.set_active_session(session_id)
+  end
+
+  local target = sm.get_session(session_id)
+  if not target then
+    return
+  end
+
+  vim.schedule(function()
+    vim.notify(string.format("Claude session %d: %s", n, target.name or target.id), vim.log.levels.INFO)
+  end)
+
+  M.toggle_session(target.id, opts_override)
+end
+
+-- Close a session by id (or the active one when nil). When other sessions
+-- remain, the window is reused for a successor if the provider supports it.
+function M.close_session(session_id)
+  local sm = session_manager_mod
+  session_id = session_id or sm.get_active_session_id()
+  if not session_id then
+    return
+  end
+
+  local provider = get_provider()
+  local effective_config = build_config(nil)
+  local session_count = sm.get_session_count()
+
+  -- Drop the buffer<->session mapping before the provider deletes the buffer,
+  -- so a recycled bufnr can't resolve to a dead session via get_visible_session_id.
+  local closing_bufnr = provider.get_session_bufnr and provider.get_session_bufnr(session_id)
+  if closing_bufnr then
+    M.unregister_buffer_session(closing_bufnr)
+  end
+
+  local was_active = sm.get_active_session_id() == session_id
+
+  if session_count > 1 then
+    -- Successor is only needed when the closed session was the active (and thus
+    -- displayed) one; closing a non-active session leaves the window untouched.
+    local new_active_id
+    if was_active then
+      for _, s in ipairs(sm.list_sessions()) do
+        if s.id ~= session_id then
+          new_active_id = s.id
+          break
+        end
+      end
+    end
+
+    if was_active and new_active_id and provider.close_session_keep_window then
+      -- Closing the displayed (active) session: reuse its window for the successor.
+      provider.close_session_keep_window(session_id, new_active_id, effective_config)
+      sm.destroy_session(session_id)
+      sm.set_active_session(new_active_id)
+    elseif was_active and new_active_id then
+      -- No window-reuse support: stop, destroy, then focus the successor.
+      if provider.close_session then
+        provider.close_session(session_id)
+      else
+        provider.close()
+      end
+      sm.destroy_session(session_id)
+      if provider.focus_session then
+        provider.focus_session(new_active_id, effective_config)
+      end
+      sm.set_active_session(new_active_id)
+    else
+      -- Closing a non-active session: its buffer isn't in the window. Stop its
+      -- terminal and destroy; leave the window and the active session untouched.
+      if provider.close_session then
+        provider.close_session(session_id)
+      else
+        provider.close()
+      end
+      sm.destroy_session(session_id)
+    end
+  else
+    -- Last session: close everything.
+    if provider.close_session then
+      provider.close_session(session_id)
+    else
+      provider.close()
+    end
+    sm.destroy_session(session_id)
+  end
 end
 
 ---Toggle open terminal without focus if not already visible, otherwise do nothing.
@@ -663,10 +1040,19 @@ function M.toggle(opts_override, cmd_args)
 end
 
 ---Gets the buffer number of the currently active Claude Code terminal.
----This checks both Snacks and native fallback terminals.
+---Prefers the active session's buffer for session-aware providers, then falls
+---back to the provider's active buffer.
 ---@return number|nil The buffer number if an active terminal is found, otherwise nil.
 function M.get_active_terminal_bufnr()
-  return get_provider().get_active_bufnr()
+  local provider = get_provider()
+  local active_id = M.get_active_session_id()
+  if active_id and provider.get_session_bufnr then
+    local bufnr = provider.get_session_bufnr(active_id)
+    if bufnr then
+      return bufnr
+    end
+  end
+  return provider.get_active_bufnr()
 end
 
 ---Sends raw text to the running Claude Code terminal's job channel, as if it were

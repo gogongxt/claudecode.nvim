@@ -3,8 +3,10 @@ require("tests.mocks.vim")
 
 -- #228 (b): send_at_mention fires `User ClaudeCodeSendComplete` on a successful
 -- connected send, carrying the formatted path/lines Claude received. It does NOT
--- fire when the broadcast was not successful (and, by design, not on the queued
--- disconnected path — that delivery is debounced and never re-enters send_at_mention).
+-- fire when the broadcast was not successful. It DOES fire on the queued
+-- disconnected path: an external/none provider (which needs this event to focus
+-- its Claude session) is the most likely to land there, since Claude hasn't
+-- connected to the WS server yet when the terminal first opens.
 describe("ClaudeCodeSendComplete event (#228)", function()
   local saved_require
   local claudecode
@@ -152,6 +154,36 @@ describe("ClaudeCodeSendComplete event (#228)", function()
     claudecode.send_at_mention("/abs/baz.lua", 1, 2, "ClaudeCodeSend")
 
     assert.is_nil(last_send_complete())
+  end)
+
+  -- The queued (disconnected) path must also fire ClaudeCodeSendComplete: an
+  -- external/none provider relies on it to focus its Claude session, and that
+  -- provider lands here because Claude hasn't connected to the WS server yet
+  -- when the terminal first opens.
+  it("fires on the queued disconnected path", function()
+    setup_mocks()
+    -- Force the disconnected branch.
+    local saved_connected = claudecode.is_claude_connected
+    claudecode.is_claude_connected = function()
+      return false
+    end
+    -- The disconnected path queues the mention and launches the terminal.
+    claudecode.state.mention_queue = {}
+
+    claudecode.send_at_mention("/abs/qux.lua", 3, 5, "ClaudeCodeSend")
+
+    claudecode.is_claude_connected = saved_connected
+    -- Mention was queued and terminal.open was called (proves we took the
+    -- disconnected branch, not the connected one).
+    assert.is_equal(1, #claudecode.state.mention_queue)
+    assert.spy(mock_terminal.open).was_called(1)
+
+    local ev = last_send_complete()
+    assert.is_not_nil(ev)
+    assert.is_equal("/abs/qux.lua", ev.opts.data.file_path)
+    assert.is_equal(3, ev.opts.data.start_line)
+    assert.is_equal(5, ev.opts.data.end_line)
+    assert.is_equal("ClaudeCodeSend", ev.opts.data.context)
   end)
 
   -- Drive the REAL _broadcast_at_mention (NOT stubbed) so the payload's formatted

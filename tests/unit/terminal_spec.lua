@@ -882,6 +882,163 @@ describe("claudecode.terminal (wrapper for Snacks.nvim)", function()
     end)
   end)
 
+  describe("cmd_args routing with an existing session terminal", function()
+    -- Regression: `:ClaudeCode --resume <id>` used to toggle the existing
+    -- session's terminal and silently drop --resume, because open_session /
+    -- toggle_session short-circuit when the session already has a live buffer.
+    -- With cmd_args present and a live terminal on the active session, the
+    -- wrapper must open a brand-new session so the args actually reach claude.
+    local session_mod
+    local custom_provider
+    local open_session_spy
+    local get_session_bufnr_spy
+
+    before_each(function()
+      -- Force a fresh load of BOTH the wrapper and the session module so they
+      -- share the same session registry. The wrapper captures
+      -- `local session_manager_mod = require("claudecode.session")` at load
+      -- time, so re-requiring only the session module would leave the wrapper
+      -- pinned to a stale upvalue.
+      package.loaded["claudecode.session"] = nil
+      package.loaded["claudecode.terminal"] = nil
+      session_mod = require("claudecode.session")
+      session_mod.reset()
+      terminal_wrapper = require("claudecode.terminal")
+
+      open_session_spy = spy.new(function() end)
+      get_session_bufnr_spy = spy.new(function()
+        return 9999
+      end)
+      -- Wrap spies in real functions: provider_has_sessions() checks
+      -- `type(provider.open_session) == "function"`, and busted spies are
+      -- tables, not functions. Routing them through function wrappers keeps
+      -- the spy call-recording while satisfying the type check.
+      local toggle_session_spy = spy.new(function() end)
+      custom_provider = {
+        setup = function() end,
+        open = function() end,
+        close = function() end,
+        simple_toggle = function() end,
+        focus_toggle = function() end,
+        get_active_bufnr = function()
+          return nil
+        end,
+        is_available = function()
+          return true
+        end,
+        open_session = function(...)
+          return open_session_spy(...)
+        end,
+        toggle_session = function(...)
+          return toggle_session_spy(...)
+        end,
+        close_session = function() end,
+        focus_session = function() end,
+        get_session_bufnr = function(...)
+          return get_session_bufnr_spy(...)
+        end,
+      }
+      -- Expose toggle_session spy for assertions (cannot index a function
+      -- wrapper, so we stash the spy on the provider table).
+      custom_provider._toggle_session_spy = toggle_session_spy
+
+      terminal_wrapper.setup({ provider = custom_provider })
+    end)
+
+    after_each(function()
+      if session_mod then
+        session_mod.reset()
+      end
+      package.loaded["claudecode.session"] = nil
+      package.loaded["claudecode.terminal"] = nil
+    end)
+
+    it("simple_toggle with cmd_args opens a new session instead of toggling", function()
+      local first_id = session_mod.create_session()
+      session_mod.set_active_session(first_id)
+
+      local before_count = session_mod.get_session_count()
+
+      terminal_wrapper.simple_toggle({}, "--resume abc123")
+
+      -- A new session was created.
+      assert.are.equal(before_count + 1, session_mod.get_session_count())
+      -- open_session was called (not toggle_session), and the new session is active.
+      open_session_spy:was_called(1)
+      local call = open_session_spy:get_call(1)
+      local session_id = call.refs[1]
+      local cmd_string = call.refs[2]
+      assert.are.equal(session_mod.get_active_session_id(), session_id)
+      assert.are_not_equal(first_id, session_id)
+      assert.is_truthy(string.find(cmd_string, "--resume abc123", 1, true))
+    end)
+
+    it("simple_toggle without cmd_args still toggles the existing session", function()
+      local first_id = session_mod.create_session()
+      session_mod.set_active_session(first_id)
+
+      terminal_wrapper.simple_toggle({}, nil)
+
+      -- No new session created.
+      assert.are.equal(1, session_mod.get_session_count())
+      assert.are.equal(first_id, session_mod.get_active_session_id())
+      -- toggle_session was called on the existing session, not open_session.
+      custom_provider._toggle_session_spy:was_called(1)
+      open_session_spy:was_called(0)
+    end)
+
+    it("open with cmd_args opens a new session when one already exists", function()
+      local first_id = session_mod.create_session()
+      session_mod.set_active_session(first_id)
+
+      terminal_wrapper.open({}, "--continue")
+
+      assert.are.equal(2, session_mod.get_session_count())
+      open_session_spy:was_called(1)
+      local call = open_session_spy:get_call(1)
+      local cmd_string = call.refs[2]
+      assert.is_truthy(string.find(cmd_string, "--continue", 1, true))
+      assert.are_not_equal(first_id, call.refs[1])
+    end)
+
+    it("focus_toggle with cmd_args opens a new session when one already exists", function()
+      local first_id = session_mod.create_session()
+      session_mod.set_active_session(first_id)
+
+      terminal_wrapper.focus_toggle({}, "--model sonnet")
+
+      assert.are.equal(2, session_mod.get_session_count())
+      open_session_spy:was_called(1)
+      local cmd_string = open_session_spy:get_call(1).refs[2]
+      assert.is_truthy(string.find(cmd_string, "--model sonnet", 1, true))
+    end)
+
+    it("cmd_args with no existing terminal spawns on the current session", function()
+      -- No prior session: ensure_session creates one, get_session_bufnr returns
+      -- nil, so we should spawn on THAT session (not create a second one).
+      get_session_bufnr_spy = spy.new(function()
+        return nil
+      end)
+      custom_provider.get_session_bufnr = function(...)
+        return get_session_bufnr_spy(...)
+      end
+      -- Make toggle_session delegate to open_session like the real toggleterm
+      -- provider does when the session has no terminal yet.
+      custom_provider.toggle_session = function(sid, config, cmd_string, env_table)
+        custom_provider._toggle_session_spy(sid, config, cmd_string, env_table)
+        custom_provider.open_session(sid, cmd_string, env_table, config, true)
+      end
+
+      terminal_wrapper.simple_toggle({}, "--resume fresh")
+
+      assert.are.equal(1, session_mod.get_session_count())
+      open_session_spy:was_called(1)
+      local call = open_session_spy:get_call(1)
+      local cmd_string = call.refs[2]
+      assert.is_truthy(string.find(cmd_string, "--resume fresh", 1, true))
+    end)
+  end)
+
   describe("custom table provider functionality", function()
     describe("valid custom provider", function()
       it("should call setup method during terminal wrapper setup", function()

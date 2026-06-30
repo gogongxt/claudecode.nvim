@@ -237,7 +237,14 @@ describe("claudecode.init", function()
       assert(#vim.api.nvim_create_augroup.calls > 0, "nvim_create_augroup was not called")
       assert(#vim.api.nvim_create_autocmd.calls > 0, "nvim_create_autocmd was not called")
 
-      assert(vim.api.nvim_create_autocmd.calls[1].vals[1] == "VimLeavePre", "Expected VimLeavePre event")
+      local found_vim_leave_pre = false
+      for _, call in ipairs(vim.api.nvim_create_autocmd.calls) do
+        if call.vals[1] == "VimLeavePre" then
+          found_vim_leave_pre = true
+          break
+        end
+      end
+      assert(found_vim_leave_pre, "Expected VimLeavePre event")
     end)
   end)
 
@@ -274,8 +281,14 @@ describe("claudecode.init", function()
       local claudecode = require("claudecode")
       claudecode.setup({ auto_start = false })
 
-      local opts = vim.api.nvim_create_autocmd.calls[1].vals[2]
-      local callback_fn = opts.callback
+      local callback_fn = nil
+      for _, call in ipairs(vim.api.nvim_create_autocmd.calls) do
+        if call.vals[1] == "VimLeavePre" then
+          callback_fn = call.vals[2].callback
+          break
+        end
+      end
+      assert(callback_fn ~= nil, "VimLeavePre autocmd not registered")
 
       mock_server.stop.calls = {}
       mock_lockfile.remove.calls = {}

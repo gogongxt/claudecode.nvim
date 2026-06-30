@@ -69,6 +69,8 @@ The `fixtures/` directory contains test Neovim configurations for verifying plug
 4. **Selection Tracking** (`lua/claudecode/selection.lua`) - Monitors text selections and sends updates to Claude
 5. **Diff Integration** (`lua/claudecode/diff.lua`) - Native Neovim diff support for Claude's file comparisons
 6. **Terminal Integration** (`lua/claudecode/terminal.lua`) - Manages Claude CLI terminal sessions with support for internal Neovim terminals and external terminal applications
+7. **Session Management** (`lua/claudecode/session.lua`) - Global multi-session registry: stable 1-based slots, client<->session binding, and the active-session pointer. Drives @mention routing and the tab bar.
+8. **Window Manager** (`lua/claudecode/terminal/window_manager.lua`) - Singleton owning the single global terminal window; session-aware providers swap per-session buffers into it.
 
 ### WebSocket Server Implementation
 
@@ -114,23 +116,47 @@ The WebSocket server implements secure authentication using:
 
 **Internal Terminals** (within Neovim):
 
-- **Snacks.nvim**: `terminal/snacks.lua` - Advanced terminal with floating windows
-- **Native**: `terminal/native.lua` - Built-in Neovim terminal as fallback
+- **toggleterm.nvim**: `terminal/toggleterm.lua` - Session-aware provider. Uses a single managed window (`window_manager`) and one toggleterm buffer per session, swapped via `display_buffer`. This is the only provider that supports multi-session terminals today.
+- **Snacks.nvim**: `terminal/snacks.lua` - Advanced terminal with floating windows (single-session)
+- **Native**: `terminal/native.lua` - Built-in Neovim terminal as fallback (single-session)
+- **None**: `terminal/none.lua` - No internal terminal; pairs with an external/manual Claude session
 
 **External Terminals** (separate applications):
 
-- **External Provider**: `terminal/external.lua` - Launches Claude in external terminal apps
+- **External Provider**: `terminal/external.lua` - Launches Claude in external terminal apps (single-session)
+
+**Multi-session infrastructure** (toggleterm provider only):
+
+- **Session manager** (`lua/claudecode/session.lua`) - Owns the global session list, stable 1-based slots, and client<->session binding. Sessions are global (not per-tabpage).
+- **Window manager** (`lua/claudecode/terminal/window_manager.lua`) - Singleton owning THE global terminal window; providers create per-session buffers and swap them via `display_buffer`.
+- **Tab bar** (`lua/claudecode/terminal/tabbar.lua`) - Per-tab UI showing one label per Claude session; click to switch, middle-click to close. Float window over the terminal (or winbar fallback for splits).
+
+Providers without `open_session`/`close_session`/`focus_session`/`get_session_bufnr` (snacks/native/external/none) keep single-terminal behavior; the session manager still tracks an "active" session for mention routing.
 
 **Configuration Example**:
 
 ```lua
 opts = {
   terminal = {
-    provider = "external",  -- "auto", "snacks", "native", or "external"
-    external_terminal_cmd = "alacritty -e %s"  -- Required for external provider
+    provider = "toggleterm",  -- "auto", "toggleterm", "snacks", "native", "external", or "none"
+    external_terminal_cmd = "alacritty -e %s",  -- Required for external provider
+    tabs = {  -- session tab bar (toggleterm provider)
+      enabled = true,
+      show_close_button = true,
+      show_new_button = true,
+      keymaps = { next_tab = false, prev_tab = false, new_tab = false, close_tab = false },
+    },
   }
 }
 ```
+
+**Multi-session user commands** (toggleterm provider; no-ops for single-session providers):
+
+- `:ClaudeCodeNew [args]` - Open a new Claude session and focus it
+- `:ClaudeCodeSwitch {index|id|name}` - Switch to a session by 1-based slot, id, or name
+- `:ClaudeCodeCloseSession [{index|id|name}]` - Close a session (default: active)
+- `:ClaudeCodeSessions [{n}]` - Toggle session N (creates it if missing), or pick from a list
+- `:ClaudeCodeRenameSession [{name}]` - Rename the active session (prompts if no name)
 
 ### Key File Locations
 
@@ -144,6 +170,11 @@ opts = {
 The plugin emits `User` autocmds (not config fields) that integrations can hook:
 
 - **`ClaudeCodeSendComplete`** - Fired in `M.send_at_mention` (init.lua) once per file, synchronously, when a send is accepted on the connected branch (acceptance-time, not delivery; not fired on the queued/disconnected path). `data = { file_path, start_line, end_line, context }` — `file_path` is the formatted path Claude received, lines are 0-indexed and may be nil. Primary use: focus an external Claude session (`provider = "none"`/`"external"`) where `focus_after_send` is inert. Emitted via the guarded, pcall-wrapped `fire_send_complete` helper (no-op when `vim.api.nvim_exec_autocmds` is absent, e.g. minimal test stubs). See `lua/claudecode/types.lua` `ClaudeCodeSendCompleteData` and README "Events".
+- **Session lifecycle** (`lua/claudecode/session.lua`, multi-session setups) - Fired via `fire_user_event`, which defers to `vim.schedule` when in a libuv fast-event context (server callbacks) and fires synchronously otherwise:
+  - **`ClaudeCodeSessionCreated`** - `data = { session_id, name, slot }`
+  - **`ClaudeCodeSessionDestroyed`** - `data = { session_id }`
+  - **`ClaudeCodeSessionActivated`** - `data = { session_id }`. Fired on active-session switch (skipped when already active).
+  - **`ClaudeCodeSessionNameChanged`** - `data = { session_id, name, old_name }`
 
 ## MCP Protocol Compliance
 
@@ -203,7 +234,7 @@ mise run test  # Recommended for complete validation
 
 **Coverage Metrics**:
 
-- **320+ tests** covering all MCP tools and core functionality
+- **778 tests** covering all MCP tools and core functionality
 - **Unit Tests**: Individual tool behavior and error cases
 - **Integration Tests**: End-to-end MCP protocol flow
 - **Format Tests**: MCP compliance and VS Code compatibility
@@ -364,7 +395,7 @@ Log levels for authentication events:
 
 ### Integration Support
 
-- Terminal integration supports both snacks.nvim and native Neovim terminal
+- Terminal integration supports toggleterm.nvim (multi-session), snacks.nvim, native Neovim terminal, external terminal apps, and a "none" provider
 - Compatible with popular file explorers (nvim-tree, oil.nvim, neo-tree, mini.files)
 - Visual selection tracking across different selection modes
 
@@ -481,7 +512,7 @@ error({
 
 ### Code Quality Standards
 
-- **Test Coverage**: Maintain comprehensive test coverage (currently **320+ tests**, 100% success rate)
+- **Test Coverage**: Maintain comprehensive test coverage (currently **778 tests**, 100% success rate)
 - **Zero Warnings**: All code must pass luacheck with 0 warnings/errors
 - **MCP Compliance**: All tools must return proper MCP format with JSON-stringified content
 - **VS Code Compatibility**: New tools must match VS Code extension behavior exactly
@@ -491,7 +522,7 @@ error({
 ### Development Quality Gates
 
 1. **`mise run check`** - Syntax and linting (0 warnings required)
-2. **`mise run test`** - All tests passing (320/320 success rate required)
+2. **`mise run test`** - All tests passing (778/778 success rate required)
 3. **`mise run format`** - Consistent code formatting
 4. **MCP Validation** - Tools return proper format structure
 5. **Integration Test** - End-to-end protocol flow verification

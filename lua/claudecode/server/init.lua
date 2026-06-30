@@ -77,8 +77,14 @@ function M.start(config, auth_token)
         (reason or "N/A") .. ")"
       )
 
-      -- Close diffs this client opened but never resolved (issue #248) -- only if
-      -- the diff module is in use. Scheduled: diff cleanup touches window APIs.
+      -- Unbind so the session slot can be reused by a fresh Claude CLI process.
+      local ok_sm, sm = pcall(require, "claudecode.session")
+      if ok_sm and sm and client and client.id then
+        sm.unbind_client(client.id)
+      end
+
+      -- Close diffs this client opened but never resolved (#248). Scheduled:
+      -- diff cleanup touches window APIs.
       local diff = package.loaded["claudecode.diff"]
       if diff then
         local client_id = client.id
@@ -119,10 +125,8 @@ function M.stop()
     M.state.ping_timer = nil
   end
 
-  -- Reject any still-pending diffs before teardown -- stop_server bypasses
-  -- on_disconnect (#248). Pending only, so saved-but-unflushed edits survive;
-  -- only if the diff module is in use, and while clients can still receive
-  -- DIFF_REJECTED.
+  -- Reject pending diffs before teardown — stop_server bypasses on_disconnect
+  -- (#248). Saved-but-unflushed edits survive; only pending diffs close.
   local diff = package.loaded["claudecode.diff"]
   if diff then
     diff.close_pending_diffs("server stopping")
@@ -130,7 +134,6 @@ function M.stop()
 
   tcp_server.stop_server(M.state.server)
 
-  -- CRITICAL: Clear global deferred responses to prevent memory leaks and hanging
   if _G.claude_deferred_responses then
     _G.claude_deferred_responses = {}
   end
@@ -191,20 +194,15 @@ function M._handle_request(client, request)
 
   local success, result, error_data = pcall(handler, client, params)
   if success then
-    -- Check if this is a deferred response (blocking tool)
     if result and result._deferred then
-      logger.debug("server", "Handler returned deferred response - storing for later")
-      -- Store the request info for later response
-      local deferred_info = {
+      M._setup_deferred_response({
         client = result.client,
         id = id,
         coroutine = result.coroutine,
         method = method,
         params = result.params,
-      }
-      -- Set up the completion callback
-      M._setup_deferred_response(deferred_info)
-      return -- Don't send response now
+      })
+      return
     end
 
     if error_data then
@@ -216,33 +214,21 @@ function M._handle_request(client, request)
     M.send_response(client, id, nil, {
       code = -32603,
       message = "Internal error",
-      data = tostring(result), -- result contains error message when pcall fails
+      data = tostring(result),
     })
   end
 end
 
--- Add a unique module ID to detect reloading
-local module_instance_id = math.random(10000, 99999)
-logger.debug("server", "Server module loaded with instance ID:", module_instance_id)
-
 function M._setup_deferred_response(deferred_info)
   local co = deferred_info.coroutine
-
   logger.debug("server", "Setting up deferred response for coroutine:", tostring(co))
-  logger.debug("server", "Storage happening in module instance:", module_instance_id)
 
-  -- Create a response sender function that captures the current server instance
   local response_sender = function(result)
-    logger.debug("server", "Deferred response triggered for coroutine:", tostring(co))
-
     if result and result.content then
-      -- MCP-compliant response
       M.send_response(deferred_info.client, deferred_info.id, result, nil)
     elseif result and result.error then
-      -- Error response
       M.send_response(deferred_info.client, deferred_info.id, nil, result.error)
     else
-      -- Fallback error
       M.send_response(deferred_info.client, deferred_info.id, nil, {
         code = -32603,
         message = "Internal error",
@@ -251,13 +237,11 @@ function M._setup_deferred_response(deferred_info)
     end
   end
 
-  -- Store the response sender in a global location that won't be affected by module reloading
+  -- Global so the response sender survives module reloads.
   if not _G.claude_deferred_responses then
     _G.claude_deferred_responses = {}
   end
   _G.claude_deferred_responses[tostring(co)] = response_sender
-
-  logger.debug("server", "Stored response sender in global table for coroutine:", tostring(co))
 end
 
 ---Handle JSON-RPC notification (no response)
@@ -277,6 +261,33 @@ end
 function M.register_handlers()
   M.state.handlers = {
     ["initialize"] = function(client, params)
+      -- Bind the incoming client to its session. Prefer the spawn-order signal
+      -- (awaiting_handshake) over the visible buffer: if the user spawned B
+      -- then switched back to A before B's Claude process handshakes, the
+      -- visible buffer is A's — binding by visible would route B's client to A
+      -- and break :ClaudeCodeSend.
+      local ok_sm, sm = pcall(require, "claudecode.session")
+      if ok_sm and sm and client and client.id then
+        local target_id
+        local awaiting = sm.find_session_awaiting_handshake()
+        if awaiting then
+          target_id = awaiting.id
+        end
+        if not target_id then
+          local ok_t, terminal = pcall(require, "claudecode.terminal")
+          if ok_t and terminal and terminal.get_visible_session_id then
+            target_id = terminal.get_visible_session_id()
+          end
+        end
+        if not target_id then
+          local unbound = sm.find_unbound_session()
+          target_id = unbound and unbound.id or nil
+        end
+        if target_id then
+          sm.bind_client(target_id, client.id)
+        end
+      end
+
       return {
         protocolVersion = MCP_PROTOCOL_VERSION,
         capabilities = {
@@ -291,12 +302,11 @@ function M.register_handlers()
       }
     end,
 
-    ["notifications/initialized"] = function(client, params) -- Added handler for initialized notification
-    end,
+    ["notifications/initialized"] = function(client, params) end,
 
-    ["prompts/list"] = function(client, params) -- Added handler for prompts/list
+    ["prompts/list"] = function(client, params)
       return {
-        prompts = {}, -- This will be encoded as an empty JSON array
+        prompts = {},
       }
     end,
 
@@ -316,14 +326,11 @@ function M.register_handlers()
       )
       local result_or_error_table = tools.handle_invoke(client, params)
 
-      -- Check if this is a deferred response (blocking tool)
       if result_or_error_table and result_or_error_table._deferred then
         logger.debug("server", "Tool is blocking - setting up deferred response")
-        -- Return the deferred response directly - _handle_request will process it
         return result_or_error_table
       end
 
-      -- Log the response for debugging
       logger.debug("server", "Response - tools/call", params and params.name .. ":", vim.inspect(result_or_error_table))
 
       if result_or_error_table.error then
@@ -331,7 +338,6 @@ function M.register_handlers()
       elseif result_or_error_table.result then
         return result_or_error_table.result, nil
       else
-        -- Should not happen if tools.handle_invoke behaves correctly
         return nil,
           {
             code = -32603,
@@ -409,6 +415,44 @@ function M.broadcast(method, params)
   local json_message = vim.json.encode(message)
   tcp_server.broadcast(M.state.server, json_message)
   return true
+end
+
+-- Send to the client bound to the active session only. Used for per-session
+-- routing (e.g. @ mentions). When the active session has no bound client yet
+-- (handshake pending), drop instead of broadcast — broadcasting would leak to
+-- other sessions' Claude processes. The caller's mention-queue retry handles
+-- re-delivery once the client binds.
+---@return boolean success
+function M.send_to_active_session(method, params)
+  if not M.state.server then
+    return false
+  end
+
+  local json_message = vim.json.encode({
+    jsonrpc = "2.0",
+    method = method,
+    params = params or vim.empty_dict(),
+  })
+
+  local ok_sm, sm = pcall(require, "claudecode.session")
+  if ok_sm and sm then
+    local active_id = sm.get_active_session_id()
+    local session = active_id and sm.get_session(active_id) or nil
+    local client_id = session and session.client_id or nil
+    if client_id then
+      tcp_server.send_to_client(M.state.server, client_id, json_message)
+      return true
+    end
+    logger.debug("server", "send_to_active_session: no bound client for active session ", tostring(active_id))
+    return false
+  end
+
+  -- No session module: return false so the caller's mention-queue retry
+  -- handles re-delivery. Broadcasting here would silently leak @mentions to
+  -- every connected Claude process in a multi-session setup — exactly the
+  -- leak this function exists to prevent.
+  logger.debug("server", "send_to_active_session: session module unavailable, dropping")
+  return false
 end
 
 ---Get server status information

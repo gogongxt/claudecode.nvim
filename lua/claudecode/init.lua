@@ -36,6 +36,7 @@ M.state = {
   mention_queue = {},
   mention_timer = nil,
   connection_timer = nil,
+  mention_retry_scheduled = false,
 }
 
 ---Check if Claude Code is connected to WebSocket server
@@ -81,6 +82,8 @@ local function clear_mention_queue()
     M.state.mention_timer:close()
     M.state.mention_timer = nil
   end
+
+  M.state.mention_retry_scheduled = false
 end
 
 ---Process mentions when Claude is connected (debounced mode)
@@ -196,9 +199,22 @@ function M.process_mention_queue(from_new_connection)
   logger.debug("queue", "Processing " .. #mentions_to_send .. " queued @ mentions")
 
   -- Send mentions with a small delay between each to prevent WebSocket/extension overwhelm
+  local any_reenqueued = false
   local function send_mention_sequential(index)
     if index > #mentions_to_send then
       logger.debug("queue", "All queued mentions sent successfully")
+      -- One retry for the whole batch, not one per failed mention. Without
+      -- this guard, N mentions that all fail (handshake pending) each
+      -- schedule their own process_mention_queue(false), and each of those
+      -- re-deepcopies and re-walks the entire queue — O(N²) deferred calls
+      -- plus cross-talk between concurrent retries.
+      if any_reenqueued and not M.state.mention_retry_scheduled then
+        M.state.mention_retry_scheduled = true
+        vim.defer_fn(function()
+          M.state.mention_retry_scheduled = false
+          M.process_mention_queue(false)
+        end, 300)
+      end
       return
     end
 
@@ -216,11 +232,31 @@ function M.process_mention_queue(from_new_connection)
         lineEnd = mention.end_line,
       }
 
-      local broadcast_success = M.state.server.broadcast("at_mentioned", params)
+      -- Route to the active session's bound client only. When the active
+      -- session has no bound client yet (handshake pending), send_to_active_session
+      -- returns false — we re-enqueue the mention for a short retry instead of
+      -- broadcasting (which would leak to other sessions' Claude processes).
+      -- Legacy single-session setups without send_to_active_session fall back to
+      -- broadcast, preserving historic behavior.
+      local broadcast_success
+      if M.state.server.send_to_active_session then
+        broadcast_success = M.state.server.send_to_active_session("at_mentioned", params)
+      else
+        broadcast_success = M.state.server.broadcast("at_mentioned", params)
+      end
       if broadcast_success then
         logger.debug("queue", "Sent queued @ mention: " .. mention.file_path)
       else
-        logger.error("queue", "Failed to send queued @ mention: " .. mention.file_path)
+        local now_ms = vim.loop.now()
+        local queue_timeout = M.state.config and M.state.config.queue_timeout or 5000
+        if (now_ms - mention.timestamp) < queue_timeout then
+          -- Re-enqueue; the single retry is scheduled at end-of-batch above.
+          table.insert(M.state.mention_queue, mention)
+          any_reenqueued = true
+          logger.debug("queue", "Re-enqueued @ mention (no bound client yet): " .. mention.file_path)
+        else
+          logger.error("queue", "Failed to send queued @ mention (timed out): " .. mention.file_path)
+        end
       end
     end
 
@@ -348,6 +384,13 @@ function M.send_at_mention(file_path, start_line, end_line, context)
     terminal.open()
 
     logger.debug(context, "Queued @ mention and launched Claude Code: " .. file_path)
+
+    -- Fire ClaudeCodeSendComplete for the queued path too. An external/none
+    -- provider (which needs this event to focus its Claude session) is the most
+    -- likely to land here: Claude hasn't connected to the WS server yet when the
+    -- terminal first opens. Without this, the disconnected send path never
+    -- notifies integrations, so focus_after_send consumers can't react.
+    fire_send_complete(file_path, start_line, end_line, context)
 
     return true, nil
   end
@@ -597,6 +640,37 @@ function M.stop()
   logger.info("init", "Claude Code integration stopped")
 
   return true
+end
+
+-- Resolve a user-typed argument (from :ClaudeCodeSwitch / :ClaudeCodeCloseSession
+-- / :ClaudeCodeSessions) to a session id. Numeric args match the stable slot;
+-- strings match the session id or name. Returns nil when nothing matches.
+local function resolve_session_target(arg)
+  if not arg or arg == "" then
+    return nil
+  end
+  local terminal = require("claudecode.terminal")
+  local sessions = terminal.list_sessions()
+  local n = tonumber(arg)
+  for _, s in ipairs(sessions) do
+    if (n and s.slot == n) or s.id == arg or s.name == arg then
+      return s.id
+    end
+  end
+  return nil
+end
+
+local function session_completion_items()
+  local sessions = require("claudecode.terminal").list_sessions()
+  local out = {}
+  for _, s in ipairs(sessions) do
+    table.insert(out, tostring(s.slot or 0))
+    table.insert(out, s.id)
+    if s.name then
+      table.insert(out, s.name)
+    end
+  end
+  return out
 end
 
 ---Set up user commands
@@ -1126,6 +1200,134 @@ function M._create_commands()
       bang = true,
       desc = "Send text to the open Claude Code terminal and submit it (! to insert without submitting; native/snacks providers only)",
     })
+
+    -- Multi-session commands. These are no-ops for providers without
+    -- per-session support (snacks/native/external/none), which fall back to
+    -- the single-terminal legacy behavior.
+    vim.api.nvim_create_user_command("ClaudeCodeNew", function(opts)
+      local cmd_args = opts.args and opts.args ~= "" and opts.args or nil
+      terminal.open_new_session({}, cmd_args)
+    end, {
+      nargs = "*",
+      desc = "Open a new Claude Code terminal session and focus it",
+    })
+
+    vim.api.nvim_create_user_command("ClaudeCodeSwitch", function(opts)
+      local arg = opts.args and opts.args ~= "" and vim.trim(opts.args) or nil
+      if not arg then
+        logger.warn("command", "ClaudeCodeSwitch: no session id/index provided")
+        return
+      end
+      local target_id = resolve_session_target(arg)
+      if not target_id then
+        vim.notify("ClaudeCodeSwitch: no session matching '" .. arg .. "'", vim.log.levels.WARN)
+        return
+      end
+      terminal.switch_to_session(target_id, {})
+    end, {
+      nargs = "?",
+      desc = "Switch to a Claude Code session by 1-based index, id, or name",
+      complete = session_completion_items,
+    })
+
+    vim.api.nvim_create_user_command("ClaudeCodeCloseSession", function(opts)
+      local arg = opts.args and opts.args ~= "" and vim.trim(opts.args) or nil
+      local session_id = arg and resolve_session_target(arg) or nil
+      if arg and not session_id then
+        vim.notify("ClaudeCodeCloseSession: no session matching '" .. arg .. "'", vim.log.levels.WARN)
+        return
+      end
+      terminal.close_session(session_id)
+    end, {
+      nargs = "?",
+      desc = "Close a Claude Code session by index/id/name (default: active session)",
+      complete = session_completion_items,
+    })
+
+    vim.api.nvim_create_user_command("ClaudeCodeSessions", function(opts)
+      local sessions = terminal.list_sessions()
+
+      -- Direct toggle by 1-based index: `:ClaudeCodeSessions 2` toggles session 2
+      -- without opening the picker. Numeric args create the session at that index
+      -- on demand (so <leader>a3 works on a fresh setup).
+      local arg = opts.args and opts.args ~= "" and vim.trim(opts.args) or nil
+      if arg then
+        local n = tonumber(arg)
+        if n then
+          terminal.toggle_session_by_index(n, {})
+          return
+        end
+        local target_id = resolve_session_target(arg)
+        if not target_id then
+          vim.notify("ClaudeCodeSessions: no session matching '" .. arg .. "'", vim.log.levels.WARN)
+          return
+        end
+        terminal.toggle_session(target_id, {})
+        return
+      end
+
+      -- No arg: open the picker. Empty list is reported since the picker cannot
+      -- create sessions (use ClaudeCodeNew or :ClaudeCodeSessions <n> for that).
+      if #sessions == 0 then
+        vim.notify("No Claude Code sessions. Use :ClaudeCodeNew or :ClaudeCodeSessions <n>.", vim.log.levels.INFO)
+        return
+      end
+      local active_id = terminal.get_active_session_id()
+      local items = {}
+      for i, s in ipairs(sessions) do
+        local marker = (s.id == active_id) and " *" or ""
+        local slot_num = s.slot or i
+        table.insert(items, {
+          label = string.format("%d. %s%s", slot_num, s.name or s.id, marker),
+          session_id = s.id,
+        })
+      end
+      vim.ui.select(items, {
+        prompt = "Claude Code sessions (toggle):",
+        format_item = function(item)
+          return item.label
+        end,
+      }, function(choice)
+        if choice and choice.session_id then
+          -- toggleterm-style: picking a session toggles its terminal (1 => toggle 1).
+          terminal.toggle_session(choice.session_id, {})
+        end
+      end)
+    end, {
+      nargs = "?",
+      desc = "Toggle Claude session N (creates it if missing) or pick from a list",
+    })
+
+    vim.api.nvim_create_user_command("ClaudeCodeRenameSession", function(opts)
+      local arg = opts.args and opts.args ~= "" and vim.trim(opts.args) or nil
+      local function apply(name)
+        if not terminal.rename_session(nil, name) then
+          vim.notify("ClaudeCodeRenameSession: invalid name or no active session", vim.log.levels.WARN)
+        end
+      end
+      if arg then
+        apply(arg)
+      else
+        vim.ui.input({ prompt = "Rename active Claude session:" }, function(input)
+          if input then
+            apply(input)
+          end
+        end)
+      end
+    end, {
+      nargs = "?",
+      desc = "Rename the active Claude Code session (prompts if no name given)",
+      complete = function()
+        local sessions = terminal.list_sessions()
+        local out = {}
+        for _, s in ipairs(sessions) do
+          if s.name then
+            table.insert(out, s.name)
+          end
+        end
+        return out
+      end,
+    })
   else
     logger.error(
       "init",
@@ -1301,7 +1503,12 @@ function M._broadcast_at_mention(file_path, start_line, end_line)
     (M.state.config and M.state.config.disable_broadcast_debouncing)
     or (package.loaded["busted"] and not (M.state.config and M.state.config.enable_broadcast_debouncing_in_tests))
   then
-    local broadcast_success = M.state.server.broadcast("at_mentioned", params)
+    local broadcast_success
+    if M.state.server.send_to_active_session then
+      broadcast_success = M.state.server.send_to_active_session("at_mentioned", params)
+    else
+      broadcast_success = M.state.server.broadcast("at_mentioned", params)
+    end
     if broadcast_success then
       return true, nil, sent
     else
