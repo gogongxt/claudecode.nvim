@@ -279,7 +279,11 @@ local function create_terminal_buffer(session_id, cmd_string, env_table, effecti
     dir = cwd,
     direction = "vertical",
     env = env_table,
-    close_on_exit = effective_config.auto_close ~= false,
+    -- handle_term_exit owns window + buffer closure (successor swap or, for
+    -- the last session, window close). Disabling close_on_exit keeps
+    -- toggleterm's __handle_exit from adding a redundant stopinsert! / buf
+    -- delete on top of our cleanup.
+    close_on_exit = false,
     auto_scroll = false,
     hidden = true, -- keep out of toggleterm's global :ToggleTerm set
     on_open = function(t)

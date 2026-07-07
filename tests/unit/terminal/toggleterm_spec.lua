@@ -122,6 +122,11 @@ describe("claudecode.terminal.toggleterm single-window-multi-buffer", function()
         job_id = 5000 + buf_counter,
         id = buf_counter,
         window = nil,
+        -- Capture close_on_exit + on_exit so tests can assert the provider's
+        -- exit-handling wiring (close_on_exit=false; on_exit → handle_term_exit)
+        -- without a real job. _fire_exit() simulates the process exiting.
+        close_on_exit = opts.close_on_exit,
+        _on_exit_cb = opts.on_exit,
       }
       buf_counter = buf_counter + 1
       -- open(): create a window, fire on_open (which sets window opts). The
@@ -131,6 +136,11 @@ describe("claudecode.terminal.toggleterm single-window-multi-buffer", function()
         win_counter = win_counter + 1
         if opts.on_open then
           opts.on_open(self)
+        end
+      end
+      t._fire_exit = function(self)
+        if self._on_exit_cb then
+          self._on_exit_cb(self, self.job_id, 0, "")
         end
       end
       return t
@@ -396,6 +406,66 @@ describe("claudecode.terminal.toggleterm single-window-multi-buffer", function()
 
       expect(terminal_stub.unregistered[bufnr]).to_be_true()
       expect(terminal_stub.registered[bufnr]).to_be_nil()
+    end)
+  end)
+
+  describe("process exit with multiple sessions", function()
+    -- handle_term_exit owns closure: successor swap when other sessions remain,
+    -- window close on the last exit. The stub's _fire_exit calls only on_exit,
+    -- so this covers the provider's exit logic, not toggleterm's close_on_exit.
+    it("sets close_on_exit=false so toggleterm doesn't close our window", function()
+      session_stub.active_id = "s1"
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      local state = provider._get_terminal_for_test()
+      expect(state).to_be_table()
+      expect(state.term.close_on_exit).to_be(false)
+    end)
+
+    it("displays successor buffer and keeps window open on exit", function()
+      session_stub.active_id = "s1"
+      session_stub.sessions["s1"] = { id = "s1" }
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      local s1_bufnr = wm_stub.displayed[1].bufnr
+
+      -- Spawn a second session.
+      session_stub.active_id = "s2"
+      session_stub.sessions["s2"] = { id = "s2" }
+      provider.open_session("s2", "claude", {}, { auto_close = true }, true)
+      local s2_bufnr = wm_stub.displayed[2].bufnr
+
+      -- Simulate s2's process exiting (e.g. user pressed C-c). Make s2 active
+      -- so destroy_session picks s1 as the successor.
+      session_stub.active_id = "s2"
+      wm_stub.current_buf = s2_bufnr
+      wm_stub.visible = true
+
+      local s2_state = provider._get_terminal_for_test()
+      s2_state.term:_fire_exit()
+
+      -- s1's buffer was swapped into the window (last display_buffer call).
+      local last = wm_stub.displayed[#wm_stub.displayed]
+      expect(last.bufnr).to_be(s1_bufnr)
+      -- Window was NOT closed (successor path keeps it open).
+      expect(wm_stub.closed).to_be(0)
+      -- s2's buffer was unregistered + the session destroyed.
+      expect(terminal_stub.unregistered[s2_bufnr]).to_be_true()
+      expect(session_stub.sessions["s2"]).to_be_nil()
+    end)
+
+    it("closes the window when the last session exits", function()
+      session_stub.active_id = "s1"
+      session_stub.sessions["s1"] = { id = "s1" }
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      local s1_bufnr = wm_stub.displayed[1].bufnr
+      wm_stub.current_buf = s1_bufnr
+      wm_stub.visible = true
+
+      local state = provider._get_terminal_for_test()
+      state.term:_fire_exit()
+
+      -- No successor: window closed.
+      expect(wm_stub.closed).to_be(1)
+      expect(session_stub.sessions["s1"]).to_be_nil()
     end)
   end)
 
