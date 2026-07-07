@@ -12,6 +12,8 @@ local session_manager = require("claudecode.session")
 ---@field terminal_win number|nil
 ---@field click_regions table[]
 ---@field winbar_session_ids table
+---@field last_content string|nil Last rendered float content (skip no-op rewrites)
+---@field last_config table|nil Last applied float win config (skip no-op repositions)
 
 local state = {
   tabs = {},
@@ -22,7 +24,7 @@ local state = {
 local function get_tab_state(tabpage)
   local slot = state.tabs[tabpage]
   if not slot then
-    slot = { click_regions = {}, winbar_session_ids = {} }
+    slot = { click_regions = {}, winbar_session_ids = {}, last_content = nil, last_config = nil }
     state.tabs[tabpage] = slot
   end
   return slot
@@ -265,6 +267,11 @@ local function ensure_buffer(tabpage)
     return slot.tabbar_buf
   end
 
+  -- Fresh buffer: the last_content cache no longer reflects what's on screen,
+  -- so clear it or render_float_content would skip writing and leave the new
+  -- buffer blank (content string is unchanged from the destroyed buffer).
+  slot.last_content = nil
+
   slot.tabbar_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[slot.tabbar_buf].buftype = "nofile"
   vim.bo[slot.tabbar_buf].bufhidden = "hide"
@@ -304,6 +311,50 @@ local function calc_window_config(term_win)
   return nil
 end
 
+-- Write the float content + highlights into the tabbar buffer, skipping the
+-- rewrite entirely when the content is unchanged from the last render. Terminal
+-- scrolling fires the resize autocmd frequently; without this cache every
+-- scroll would re-set the buffer lines and clear+re-add all highlights.
+local function render_float_content(tabpage, slot, content, highlights)
+  if not slot.tabbar_buf or not vim.api.nvim_buf_is_valid(slot.tabbar_buf) then
+    return
+  end
+  if content == slot.last_content then
+    return
+  end
+  vim.api.nvim_buf_set_lines(slot.tabbar_buf, 0, -1, false, { content })
+  local ns = vim.api.nvim_create_namespace("claudecode_tabbar")
+  vim.api.nvim_buf_clear_namespace(slot.tabbar_buf, ns, 0, -1)
+  for _, hl in ipairs(highlights) do
+    pcall(vim.api.nvim_buf_add_highlight, slot.tabbar_buf, ns, hl[3], 0, hl[1], hl[2])
+  end
+  slot.last_content = content
+end
+
+-- Reposition the float only when its config actually changed. calc_window_config
+-- returns the same table shape every call during a scroll storm; re-applying an
+-- identical nvim_win_set_config marks the float (and the terminal region it
+-- overlaps) for redraw each time.
+local function apply_float_config(slot, win_config)
+  if not win_config then
+    return
+  end
+  local prev = slot.last_config
+  if
+    prev
+    and prev.row == win_config.row
+    and prev.col == win_config.col
+    and prev.width == win_config.width
+    and prev.height == win_config.height
+  then
+    return
+  end
+  if slot.tabbar_win and vim.api.nvim_win_is_valid(slot.tabbar_win) then
+    pcall(vim.api.nvim_win_set_config, slot.tabbar_win, win_config)
+  end
+  slot.last_config = win_config
+end
+
 ---Show the tabbar for a tab.
 ---@param tabpage integer|nil
 function M.show(tabpage)
@@ -327,11 +378,13 @@ function M.show(tabpage)
 
   ensure_buffer(tabpage)
 
-  if slot.tabbar_win and vim.api.nvim_win_is_valid(slot.tabbar_win) then
-    vim.api.nvim_win_set_config(slot.tabbar_win, win_config)
-  else
+  if not (slot.tabbar_win and vim.api.nvim_win_is_valid(slot.tabbar_win)) then
     slot.tabbar_win = vim.api.nvim_open_win(slot.tabbar_buf, false, win_config)
     vim.api.nvim_win_set_option(slot.tabbar_win, "winhl", "Normal:ClaudeCodeTabBar")
+    slot.last_config = win_config
+    slot.last_content = nil -- fresh window: content not yet written
+  else
+    apply_float_config(slot, win_config)
   end
 
   M.render(tabpage)
@@ -352,6 +405,8 @@ function M.hide(tabpage)
     pcall(vim.api.nvim_win_close, slot.tabbar_win, true)
   end
   slot.tabbar_win = nil
+  slot.last_config = nil
+  slot.last_content = nil
   if slot.terminal_win and vim.api.nvim_win_is_valid(slot.terminal_win) then
     pcall(function()
       vim.wo[slot.terminal_win].winbar = nil
@@ -377,21 +432,10 @@ function M.render(tabpage)
   local content, highlights = build_content(tabpage)
 
   if slot.tabbar_win and vim.api.nvim_win_is_valid(slot.tabbar_win) then
-    if slot.tabbar_buf and vim.api.nvim_buf_is_valid(slot.tabbar_buf) then
-      vim.api.nvim_buf_set_lines(slot.tabbar_buf, 0, -1, false, { content })
-
-      local ns = vim.api.nvim_create_namespace("claudecode_tabbar")
-      vim.api.nvim_buf_clear_namespace(slot.tabbar_buf, ns, 0, -1)
-      for _, hl in ipairs(highlights) do
-        pcall(vim.api.nvim_buf_add_highlight, slot.tabbar_buf, ns, hl[3], 0, hl[1], hl[2])
-      end
-    end
+    render_float_content(tabpage, slot, content, highlights)
 
     if slot.terminal_win and vim.api.nvim_win_is_valid(slot.terminal_win) then
-      local win_config = calc_window_config(slot.terminal_win)
-      if win_config then
-        pcall(vim.api.nvim_win_set_config, slot.tabbar_win, win_config)
-      end
+      apply_float_config(slot, calc_window_config(slot.terminal_win))
     end
   else
     M.render_winbar(tabpage)
@@ -591,8 +635,13 @@ local function setup_autocmds()
   end
   state.augroup = vim.api.nvim_create_augroup("ClaudeCodeTabBar", { clear = true })
 
-  -- Re-position float / re-render winbar when geometry changes.
-  vim.api.nvim_create_autocmd({ "WinResized", "WinScrolled" }, {
+  -- Re-position float / re-render winbar when window GEOMETRY changes.
+  -- WinResized fires on split/terminal-window size changes. We deliberately
+  -- do NOT listen to WinScrolled: that fires on every line of terminal scroll
+  -- (Claude TUI streaming output), and the float's geometry is unaffected by
+  -- scrolling — re-running show/render on each scroll line caused a redraw
+  -- storm over the terminal and made Claude's TUI feel sluggish.
+  vim.api.nvim_create_autocmd({ "WinResized" }, {
     group = state.augroup,
     callback = function()
       for_each_tab(function(tab, slot)
