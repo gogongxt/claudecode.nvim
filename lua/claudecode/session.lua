@@ -37,7 +37,7 @@ end
 
 local function generate_session_id()
   session_counter = session_counter + 1
-  return string.format("session_%d_%d", session_counter, vim.loop.now())
+  return session_counter, string.format("session_%d_%d", session_counter, vim.loop.now())
 end
 
 ---Fire a User autocmd safely. Server callbacks (on_message/on_disconnect) run
@@ -61,7 +61,7 @@ end
 ---@return string session_id
 function M.create_session(opts)
   opts = opts or {}
-  local session_id = generate_session_id()
+  local seq, session_id = generate_session_id()
 
   local slot = opts.slot
   if not slot or used_slots[slot] then
@@ -72,6 +72,7 @@ function M.create_session(opts)
   local session = {
     id = session_id,
     slot = slot,
+    seq = seq, -- creation order; tiebreaker for created_at
     mention_queue = {},
     created_at = vim.loop.now(),
     name = opts.name or "Session",
@@ -201,11 +202,19 @@ function M.find_session_by_bufnr(bufnr)
   return nil
 end
 
+-- Creation order with a deterministic tiebreaker for same-millisecond sessions.
+local function created_before(a, b)
+  if a.created_at ~= b.created_at then
+    return a.created_at < b.created_at
+  end
+  return (a.seq or 0) < (b.seq or 0)
+end
+
 function M.find_unbound_session()
   local newest
   for _, session in pairs(M.sessions) do
     if not session.client_id then
-      if not newest or session.created_at > newest.created_at then
+      if not newest or created_before(newest, session) then
         newest = session
       end
     end
@@ -228,7 +237,7 @@ function M.find_session_awaiting_handshake()
   local oldest
   for _, session in pairs(M.sessions) do
     if session.awaiting_handshake and not session.client_id then
-      if not oldest or session.created_at < oldest.created_at then
+      if not oldest or created_before(session, oldest) then
         oldest = session
       end
     end
@@ -274,7 +283,14 @@ function M.unbind_client(client_id)
   end
 
   session.client_id = nil
-  session.awaiting_handshake = nil
+  -- Re-arm while the terminal still lives so a reconnecting client re-binds to
+  -- this session via find_session_awaiting_handshake, not the racy
+  -- find_unbound_session. Cleared once the terminal exits.
+  if session.terminal_bufnr then
+    session.awaiting_handshake = true
+  else
+    session.awaiting_handshake = nil
+  end
   logger.debug("session", "Unbound client " .. client_id .. " from session " .. session.id)
 
   return true

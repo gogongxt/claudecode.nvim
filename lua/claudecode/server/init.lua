@@ -417,11 +417,11 @@ function M.broadcast(method, params)
   return true
 end
 
--- Send to the client bound to the active session only. Used for per-session
--- routing (e.g. @ mentions). When the active session has no bound client yet
--- (handshake pending), drop instead of broadcast — broadcasting would leak to
--- other sessions' Claude processes. The caller's mention-queue retry handles
--- re-delivery once the client binds.
+-- Send to the client bound to the session the user is interacting with. Prefer
+-- the visible (focused) terminal session; fall back to the active-session
+-- pointer when no terminal is visible. Drop (not broadcast) when the resolved
+-- session has no bound client yet — broadcasting would leak to other sessions'
+-- Claude processes; the caller's mention-queue retry re-delivers on bind.
 ---@return boolean success
 function M.send_to_active_session(method, params)
   if not M.state.server then
@@ -436,14 +436,24 @@ function M.send_to_active_session(method, params)
 
   local ok_sm, sm = pcall(require, "claudecode.session")
   if ok_sm and sm then
-    local active_id = sm.get_active_session_id()
-    local session = active_id and sm.get_session(active_id) or nil
+    local target_id
+    local ok_t, terminal = pcall(require, "claudecode.terminal")
+    if ok_t and terminal and terminal.get_visible_session_id then
+      target_id = terminal.get_visible_session_id()
+    end
+    local source = "visible"
+    if not target_id then
+      target_id = sm.get_active_session_id()
+      source = "active"
+    end
+
+    local session = target_id and sm.get_session(target_id) or nil
     local client_id = session and session.client_id or nil
     if client_id then
       tcp_server.send_to_client(M.state.server, client_id, json_message)
       return true
     end
-    logger.debug("server", "send_to_active_session: no bound client for active session ", tostring(active_id))
+    logger.debug("server", "send_to_active_session: no bound client for ", source, " session ", tostring(target_id))
     return false
   end
 
