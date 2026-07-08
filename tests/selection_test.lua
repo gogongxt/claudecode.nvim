@@ -892,10 +892,17 @@ describe("Range Selection Tests", function()
       assert(result == false)
     end)
 
-    it("should fail when tracking is disabled", function()
+    it("should still send a range when tracking is disabled", function()
+      -- track_selection=false disables the live broadcast pipeline, but an
+      -- on-demand send with an explicit range must still work (the range is
+      -- derived from buffer marks, not tracking state).
       selection.state.tracking_enabled = false
       local result = selection.send_at_mention_for_visual_selection(2, 4)
-      assert(result == false)
+      assert(result == true)
+      assert(mock_server.last_broadcast ~= nil)
+      assert(mock_server.last_broadcast.params.filePath == "/test/file.lua")
+      assert(mock_server.last_broadcast.params.lineStart == 1) -- 0-indexed
+      assert(mock_server.last_broadcast.params.lineEnd == 3) -- 0-indexed
     end)
   end)
 

@@ -899,10 +899,11 @@ end
 ---@param line1 number|nil Optional start line for range-based selection
 ---@param line2 number|nil Optional end line for range-based selection
 function M.send_at_mention_for_visual_selection(line1, line2)
-  if not M.state.tracking_enabled then
-    logger.error("selection", "Selection tracking is not enabled.")
-    return false
-  end
+  -- NOTE: selection tracking (the live CursorMoved/ModeChanged broadcast
+  -- pipeline) is independently toggleable. A user who disables it (to drop the
+  -- "In <file>" indicator) must still be able to *send* an @mention on demand,
+  -- so we do NOT hard-fail when tracking is off. The range/live/marks fallbacks
+  -- below derive the selection without needing tracking state.
 
   -- Check if Claude Code integration is running (server may or may not have clients)
   local claudecode_main = require("claudecode")
@@ -931,8 +932,18 @@ function M.send_at_mention_for_visual_selection(line1, line2)
       if current_visual and not current_visual.selection.isEmpty then
         sel_to_send = current_visual
       else
-        logger.warn("selection", "No visual selection to send as at-mention.")
-        return false
+        -- Final fallback: the just-completed visual selection from the '<'/'>'
+        -- marks. Works when tracking is disabled AND the command fired after
+        -- visual exit (get_visual_selection needs an active visual mode, which
+        -- a plain `:ClaudeCodeSend` from a keymap has already left). Does not
+        -- depend on tracking state.
+        local from_marks = M.get_visual_selection_from_marks()
+        if from_marks and not from_marks.selection.isEmpty then
+          sel_to_send = from_marks
+        else
+          logger.warn("selection", "No visual selection to send as at-mention.")
+          return false
+        end
       end
     end
   end
