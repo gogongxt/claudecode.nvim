@@ -233,6 +233,16 @@ function M.mark_awaiting_handshake(session_id)
   end
 end
 
+-- Clear awaiting_handshake without binding (spawn-serialization timeout path:
+-- a dead handshake must not block new spawns forever).
+---@param session_id string
+function M.clear_awaiting_handshake(session_id)
+  local session = M.sessions[session_id]
+  if session then
+    session.awaiting_handshake = nil
+  end
+end
+
 function M.find_session_awaiting_handshake()
   local oldest
   for _, session in pairs(M.sessions) do
@@ -243,6 +253,14 @@ function M.find_session_awaiting_handshake()
     end
   end
   return oldest
+end
+
+-- The in-flight awaiter (or nil). The spawn path serializes on this so ≤1
+-- session awaits at a time, keeping find_session_awaiting_handshake exact.
+---@return string|nil session_id
+function M.is_handshake_in_flight()
+  local s = M.find_session_awaiting_handshake()
+  return s and s.id or nil
 end
 
 function M.find_session_by_client(client_id)

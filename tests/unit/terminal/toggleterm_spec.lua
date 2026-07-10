@@ -91,6 +91,24 @@ describe("claudecode.terminal.toggleterm single-window-multi-buffer", function()
           session_stub.active_id = next(session_stub.sessions)
         end
       end,
+      -- Spawn-serialization primitives (real session.lua has these). The stub
+      -- models a single in-flight awaiter via inflight_id.
+      inflight_id = nil,
+      is_handshake_in_flight = function()
+        return session_stub.inflight_id
+      end,
+      clear_awaiting_handshake = function(sid)
+        if session_stub.inflight_id == sid then
+          session_stub.inflight_id = nil
+        end
+      end,
+      find_session_awaiting_handshake = function()
+        return session_stub.inflight_id and { id = session_stub.inflight_id } or nil
+      end,
+      mark_awaiting_handshake = function()
+        -- spawn_when_handshake_free guards before mark; the stub keeps it a no-op
+        -- since inflight_id is what the guard consults.
+      end,
     }
 
     terminal_stub = {
@@ -347,6 +365,56 @@ describe("claudecode.terminal.toggleterm single-window-multi-buffer", function()
       -- s2 got its own toggle_number from its on_open.
       local second_bufnr = wm_stub.displayed[2].bufnr
       expect(_G.vim.api._buf_vars[second_bufnr].toggle_number).to_be(second_bufnr)
+    end)
+  end)
+
+  -- Spawn serialization: the guard defers a new spawn while another session's
+  -- handshake is in flight, so ≤1 session awaits at a time.
+  describe("spawn serialization (one handshake in flight)", function()
+    it("spawns immediately when no session is in flight", function()
+      session_stub.active_id = "s1"
+      session_stub.inflight_id = nil
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      expect(#wm_stub.displayed).to_be(1)
+    end)
+
+    it("defers the spawn while another session's handshake is in flight", function()
+      session_stub.active_id = "s1"
+      session_stub.inflight_id = "s1"
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      expect(#wm_stub.displayed).to_be(1)
+
+      -- Second spawn while s1 is in flight: the stub's non-advancing clock
+      -- drives the guard to its timeout, which clears the stale flag and
+      -- proceeds, so s2 spawns.
+      session_stub.active_id = "s2"
+      session_stub.sessions["s2"] = { id = "s2" }
+      provider.open_session("s2", "claude", {}, { auto_close = true }, true)
+
+      expect(#wm_stub.displayed).to_be(2)
+      expect(session_stub.inflight_id).to_be_nil()
+    end)
+
+    it("runs the deferred spawn once the in-flight session clears (no timeout)", function()
+      -- is_handshake_in_flight returns s1 on the first poll, nil after, so the
+      -- deferred spawn proceeds without the timeout.
+      local polls = 0
+      session_stub.inflight_id = "s1"
+      local real_inflight = session_stub.is_handshake_in_flight
+      session_stub.is_handshake_in_flight = function()
+        polls = polls + 1
+        if polls <= 1 then
+          return "s1"
+        end
+        return nil
+      end
+
+      session_stub.active_id = "s1"
+      provider.open_session("s1", "claude", {}, { auto_close = true }, true)
+      -- s1's own spawn: first poll sees inflight "s1" (itself, before mark),
+      -- waits one tick, then proceeds on poll #2.
+      expect(#wm_stub.displayed).to_be(1)
+      session_stub.is_handshake_in_flight = real_inflight
     end)
   end)
 

@@ -359,6 +359,65 @@ local function is_session_valid(session_id)
   return state ~= nil and state.bufnr ~= nil and vim.api.nvim_buf_is_valid(state.bufnr)
 end
 
+-- Serialize spawns so ≤1 session awaits its handshake at a time. The server
+-- binds each arriving client to the oldest awaiter; with several awaiting at
+-- once, unordered handshake arrival scrambles the binding (wrong-Claude sends).
+-- Blocking a new spawn until the in-flight one resolves makes that rule exact.
+--
+-- The in-flight session clears itself in two normal ways: it binds a client
+-- (bind_client clears awaiting_handshake) or its terminal exits (handle_term_exit
+-- destroys the session, taking the flag with it). Both make
+-- is_handshake_in_flight() return nil, so we just poll until it does. The
+-- timeout is a safety net for a LEAKED flag (a bug) — a slow-but-alive handshake
+-- is NOT stale; Claude's cold start can take several seconds (config
+-- connection_timeout defaults to 10s), so we must not clear a live awaiter.
+---@param fn function Spawn continuation (mark + term:open + display).
+local function spawn_when_handshake_free(fn)
+  local sm = session_manager()
+  if not (sm and sm.is_handshake_in_flight) then
+    fn()
+    return
+  end
+
+  local has_loop = vim.loop ~= nil and type(vim.loop.now) == "function"
+  local has_defer = type(vim.defer_fn) == "function"
+  local started = has_loop and vim.loop.now() or 0
+  local poll_interval = 50 -- ms
+  -- Match config.connection_timeout (10s): a live but slow Claude handshake is
+  -- normal and must not be declared stale. Only a LEAKED flag (no bind, no
+  -- terminal exit) should ever trip this.
+  local timeout_ms = 10000
+  local iters = 0
+  local max_iters = math.floor(timeout_ms / poll_interval) + 10 -- backstop for non-advancing test clocks
+
+  local function try_run()
+    local inflight_id = sm.is_handshake_in_flight()
+    if inflight_id then
+      iters = iters + 1
+      local now = has_loop and vim.loop.now() or started
+      local timed_out = (now - started) >= timeout_ms
+      local can_poll = has_defer and not timed_out and iters < max_iters
+      if can_poll then
+        vim.defer_fn(try_run, poll_interval)
+        return
+      end
+      -- Safety net only: flag leaked past connection_timeout with no bind and
+      -- no terminal exit. Clear it so creation isn't wedged; warn so the leak
+      -- is visible.
+      logger.warn(
+        "terminal",
+        "spawn serialization timeout: clearing leaked awaiting_handshake for " .. tostring(inflight_id)
+      )
+      if sm.clear_awaiting_handshake then
+        sm.clear_awaiting_handshake(inflight_id)
+      end
+    end
+    fn()
+  end
+
+  try_run()
+end
+
 function M.setup()
   -- toggleterm.nvim is configured by the user's own setup; nothing to do.
 end
@@ -398,40 +457,44 @@ function M.open_session(session_id, cmd_string, env_table, config, focus)
     return
   end
 
-  local bufnr, jobid = create_terminal_buffer(session_id, cmd_string, env_table, config)
-  if not bufnr then
-    return
-  end
+  -- Fresh spawn: serialized (see spawn_when_handshake_free) so the mark + open
+  -- + display run as one unit once the handshake slot is free.
+  spawn_when_handshake_free(function()
+    local bufnr, jobid = create_terminal_buffer(session_id, cmd_string, env_table, config)
+    if not bufnr then
+      return
+    end
 
-  -- Fresh spawn: one refresh to sync initial PTY dims, then display. New
-  -- sessions start in terminal mode ("t").
-  capture_displayed_session_mode()
-  local want = "t"
-  window_manager().display_buffer(bufnr, false)
-  window_manager().refresh_window()
+    -- Fresh spawn: one refresh to sync initial PTY dims, then display. New
+    -- sessions start in terminal mode ("t").
+    capture_displayed_session_mode()
+    local want = "t"
+    window_manager().display_buffer(bufnr, false)
+    window_manager().refresh_window()
 
-  local terminal_module = require("claudecode.terminal")
-  terminal_module.update_session_terminal_info(session_id, {
-    bufnr = bufnr,
-    winid = window_manager().get_window(),
-    jobid = jobid,
-  })
-  terminal_module.register_buffer_session(bufnr, session_id)
-  attach_tabbar(bufnr)
-  if focus then
-    local winid = window_manager().get_window()
-    local do_focus = function()
-      if winid and vim.api.nvim_win_is_valid(winid) then
-        window_manager().focus_window(winid)
+    local terminal_module = require("claudecode.terminal")
+    terminal_module.update_session_terminal_info(session_id, {
+      bufnr = bufnr,
+      winid = window_manager().get_window(),
+      jobid = jobid,
+    })
+    terminal_module.register_buffer_session(bufnr, session_id)
+    attach_tabbar(bufnr)
+    if focus then
+      local winid = window_manager().get_window()
+      local do_focus = function()
+        if winid and vim.api.nvim_win_is_valid(winid) then
+          window_manager().focus_window(winid)
+        end
+        restore_mode(bufnr, want)
       end
-      restore_mode(bufnr, want)
+      if vim.schedule then
+        vim.schedule(do_focus)
+      else
+        do_focus()
+      end
     end
-    if vim.schedule then
-      vim.schedule(do_focus)
-    else
-      do_focus()
-    end
-  end
+  end)
 end
 
 ---Close a specific session's terminal. Does NOT touch the window (window_manager

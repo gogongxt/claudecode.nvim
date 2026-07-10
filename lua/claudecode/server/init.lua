@@ -266,6 +266,10 @@ function M.register_handlers()
       -- then switched back to A before B's Claude process handshakes, the
       -- visible buffer is A's — binding by visible would route B's client to A
       -- and break :ClaudeCodeSend.
+      --
+      -- The spawn path serializes so ≤1 session awaits at a time
+      -- (spawn_when_handshake_free), making the "oldest awaiting" rule below
+      -- exact rather than a guess on handshake arrival order.
       local ok_sm, sm = pcall(require, "claudecode.session")
       if ok_sm and sm and client and client.id then
         local target_id
