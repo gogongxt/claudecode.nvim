@@ -12,6 +12,7 @@ local session_manager = require("claudecode.session")
 ---@field terminal_win number|nil
 ---@field click_regions table[]
 ---@field winbar_session_ids table
+---@field viewport_start integer|nil 1-based index (into list_sessions) of the first visible session; the sliding window. Persists across renders so it only moves when active goes out of range.
 ---@field last_content string|nil Last rendered float content (skip no-op rewrites)
 ---@field last_config table|nil Last applied float win config (skip no-op repositions)
 
@@ -24,7 +25,13 @@ local state = {
 local function get_tab_state(tabpage)
   local slot = state.tabs[tabpage]
   if not slot then
-    slot = { click_regions = {}, winbar_session_ids = {}, last_content = nil, last_config = nil }
+    slot = {
+      click_regions = {},
+      winbar_session_ids = {},
+      viewport_start = nil,
+      last_content = nil,
+      last_config = nil,
+    }
     state.tabs[tabpage] = slot
   end
   return slot
@@ -58,8 +65,270 @@ local function setup_highlights()
   hl(0, "ClaudeCodeTabClose", { link = "Error", default = true })
 end
 
+-- Display name for a session, shown in full. The sliding window drops whole
+-- tabs to fit rather than truncating names, so a session's full name is always
+-- rendered when its tab is visible.
+local function display_name(session, fallback_idx)
+  return session.name or ("Session " .. tostring(fallback_idx))
+end
+
+-- Width (in display cells) a tab block occupies: " N:name " plus the optional
+-- "✕ " close button. `slot_len` is the display width of the slot number (1 for
+-- slots 1-9, 2 for 10-99, …) and `name_len` is the name length before padding.
+local function tab_block_width(slot_len, name_len, with_close)
+  local w = 1 + slot_len + 1 + name_len + 1 -- " " + slot + ":" + name + " "
+  if with_close then
+    w = w + 2 -- "✕ "
+  end
+  return w
+end
+
+-- Full width of a rendered tab (separator excluded), using its display name.
+local function tab_width(session, with_close)
+  local slot_len = #tostring(session.slot or 0)
+  return tab_block_width(slot_len, #display_name(session), with_close)
+end
+
+---Compute the sliding-window layout for the session tab bar.
+---
+---The visible region is a *contiguous* slice of the slot-ordered session list,
+---like a bufferline/tabline plugin: from `slot.viewport_start`, admit whole tabs
+---(names are never shrunk to fit — a tab that doesn't fit is dropped, not
+---truncated) until the window width is exhausted. The active session is always
+---kept inside the window: if it falls off either edge, the window scrolls the
+---minimum amount to bring it back (right edge → align active to the window's
+---right; left edge → align to the left). Otherwise the window does not move, so
+---switching among already-visible sessions causes no jump.
+---
+---Folded sides are marked: `‹` when sessions exist before the window, `›` when
+---sessions exist after. Both are clickable scroll regions (handled by the
+---builders). The `+` new button sits at the far right after `›`.
+---
+---`slot.viewport_start` is persisted on the slot so the window survives renders
+---and only moves when active goes out of range (or the user clicks ‹/›).
+---
+---Returns:
+---   { entries = { {session, slot_num, name, is_active, show_close} ... },
+---     show_new = bool, left_fold = bool, right_fold = bool,
+---     viewport_start = integer (updated), viewport_end = integer }
+---@param slot table Tab slot (reads/writes viewport_start)
+---@param sessions table[] Slot-ordered session list
+---@param active_id string|nil
+---@param available_width integer|nil Terminal window width; nil = no cap
+---@return table
+local function compute_layout(slot, sessions, active_id, available_width)
+  local show_close = state.config and state.config.show_close_button
+  local show_new = state.config and state.config.show_new_button
+
+  local layout = {
+    entries = {},
+    show_new = show_new,
+    left_fold = false,
+    right_fold = false,
+    viewport_start = 1,
+    viewport_end = #sessions,
+  }
+
+  if #sessions == 0 then
+    layout.show_new = false
+    return layout
+  end
+
+  -- Uncapped (no terminal width known): render everything, no folding.
+  if not available_width or available_width <= 0 then
+    for i, session in ipairs(sessions) do
+      layout.entries[#layout.entries + 1] = {
+        session = session,
+        slot_num = session.slot or i,
+        name = display_name(session, i),
+        is_active = session.id == active_id,
+        show_close = show_close,
+      }
+    end
+    return layout
+  end
+
+  local SEP = 1 -- "|" between adjacent rendered tabs
+  local new_btn_w = show_new and 3 or 0 -- " + "
+  local MARKER_W = 1 -- "‹" / "›"
+
+  -- Width budget reserved for the fixed right-edge elements, given whether the
+  -- right side will be folded. We don't know the folds yet, so we compute the
+  -- window conservatively then fix up markers at the end.
+  --
+  -- Approach: find the largest window [start..end] (contiguous) such that the
+  -- rendered width fits, then ensure active is inside it.
+
+  -- Resolve the active session's 1-based index in `sessions`.
+  local active_idx = nil
+  if active_id then
+    for i, s in ipairs(sessions) do
+      if s.id == active_id then
+        active_idx = i
+        break
+      end
+    end
+  end
+
+  -- Width of rendering tabs [start..end] inclusive, including separators and
+  -- the leading left marker / trailing right marker / new button as requested.
+  local function window_width(start_idx, end_idx, left_fold, right_fold)
+    local w = 0
+    if left_fold then
+      w = w + MARKER_W + SEP
+    end
+    for i = start_idx, end_idx do
+      if i > start_idx then
+        w = w + SEP
+      end
+      w = w + tab_width(sessions[i], show_close)
+    end
+    if right_fold then
+      w = w + SEP + MARKER_W
+    end
+    if show_new then
+      w = w + SEP + new_btn_w
+    end
+    return w
+  end
+
+  -- Clamp the saved viewport_start into a valid range.
+  local start = slot.viewport_start or 1
+  if start < 1 then
+    start = 1
+  end
+  if start > #sessions then
+    start = #sessions
+  end
+
+  -- Grow a window from `from` rightward as far as fits, accounting for the fold
+  -- markers and new button that the final render will add. Returns the last
+  -- index that fits (inclusive), or `from - 1` if even the first tab doesn't.
+  local function fit_right(from)
+    if from > #sessions then
+      return from - 1
+    end
+    local ending = from
+    -- A window [from..ending] always renders at least `from`. Grow while the
+    -- full rendered width (markers + new button included) fits.
+    while ending <= #sessions do
+      local left_fold = from > 1
+      local right_fold = ending < #sessions
+      if window_width(from, ending, left_fold, right_fold) > available_width then
+        ending = ending - 1
+        break
+      end
+      if ending == #sessions then
+        break
+      end
+      ending = ending + 1
+    end
+    if ending < from then
+      ending = from -- force at least one tab; oversized tab is unavoidable
+    end
+    return ending
+  end
+
+  -- First pass: window from the saved start.
+  local ending, _ = fit_right(start)
+  if ending < start then
+    ending = start - 1 -- nothing fit yet; will be repaired below
+  end
+
+  -- Ensure the active session is inside [start..ending], UNLESS this render
+  -- follows an explicit ‹/› scroll — then the user is browsing beyond active
+  -- and we must honor their scroll position (active may leave the window).
+  local skip_active_clamp = slot.skip_active_clamp
+  slot.skip_active_clamp = nil -- one-shot: only the render right after a scroll
+
+  if active_idx and not skip_active_clamp then
+    if active_idx > ending then
+      -- active is past the right edge: slide start right until active fits.
+      -- Each iteration drops the leftmost tab and re-grows rightward.
+      while active_idx > ending and start <= active_idx do
+        start = start + 1
+        ending, _ = fit_right(start)
+        if ending < start then
+          ending = start
+        end
+      end
+    elseif active_idx < start then
+      -- active is before the left edge: snap the window's left to active so the
+      -- active tab is the first visible one.
+      start = active_idx
+      ending, _ = fit_right(start)
+      if ending < start then
+        ending = start
+      end
+    end
+  end
+
+  -- Edge case: a single tab wider than the whole window. Force at least the
+  -- active (or first) tab to render; its name is NOT shrunk — it simply
+  -- overflows one tab, which is unavoidable and better than rendering nothing.
+  if ending < start then
+    start = active_idx or 1
+    ending = start
+  end
+
+  -- Determine folds from what the window excludes.
+  layout.left_fold = start > 1
+  layout.right_fold = ending < #sessions
+
+  -- Re-verify the window fits with the now-known folds. fit_right already
+  -- reserved marker space, so these rarely fire — they're a backstop for the
+  -- oversized-single-tab edge case. Never drop the active tab.
+  local function total_w()
+    return window_width(start, ending, layout.left_fold, layout.right_fold)
+  end
+
+  -- Overflow from the right: drop rightmost non-active tabs until it fits.
+  while ending > start and total_w() > available_width do
+    if active_idx and ending == active_idx then
+      break -- never drop the active tab
+    end
+    ending = ending - 1
+    layout.right_fold = ending < #sessions
+  end
+  -- Overflow from the left: drop leftmost non-active tabs until it fits.
+  while start < ending and total_w() > available_width do
+    if active_idx and start == active_idx then
+      break -- never drop the active tab
+    end
+    start = start + 1
+    layout.left_fold = start > 1
+  end
+
+  -- If the new button no longer fits, drop it rather than overflow (overflow
+  -- re-triggers the winbar left-truncation we're fixing).
+  if show_new and total_w() > available_width then
+    layout.show_new = false
+    show_new = false
+    new_btn_w = 0
+  end
+
+  -- Persist the window for next render.
+  slot.viewport_start = start
+
+  for i = start, ending do
+    local session = sessions[i]
+    layout.entries[#layout.entries + 1] = {
+      session = session,
+      slot_num = session.slot or i,
+      name = display_name(session, i),
+      is_active = session.id == active_id,
+      show_close = show_close,
+    }
+  end
+  layout.viewport_start = start
+  layout.viewport_end = ending
+
+  return layout
+end
+
 -- Build the content line + highlight ranges for a tabpage. Populates
--- slot.click_regions for mouse dispatch.
+-- slot.click_regions for mouse dispatch (switch / close / new / scroll-left /
+-- scroll-right).
 local function build_content(tabpage)
   local slot = get_tab_state(tabpage)
   local sessions = list_sessions_for(tabpage)
@@ -71,53 +340,85 @@ local function build_content(tabpage)
     return " Claude Code ", {}
   end
 
+  local available_width = nil
+  if slot.terminal_win and vim.api.nvim_win_is_valid(slot.terminal_win) then
+    available_width = vim.api.nvim_win_get_width(slot.terminal_win)
+  end
+  local layout = compute_layout(slot, sessions, active_id, available_width)
+
   local parts = {}
   local highlights = {}
   local col = 1
 
-  for i, session in ipairs(sessions) do
-    local is_active = session.id == active_id
-    local name = session.name or ("Session " .. i)
-    if #name > 12 then
-      name = name:sub(1, 9) .. "..."
-    end
+  local function add_separator()
+    table.insert(parts, "|")
+    col = col + 1
+  end
 
-    -- Slot number (not positional index) so the tabbar matches <leader>N.
-    local slot_num = session.slot or i
-    local label = string.format(" %d:%s ", slot_num, name)
-    local hl_group = is_active and "ClaudeCodeTabActive" or "ClaudeCodeTabInactive"
+  -- Left fold marker (clickable: scroll the window one tab left).
+  if layout.left_fold then
+    local marker = "‹"
+    table.insert(slot.click_regions, {
+      start_col = col,
+      end_col = col + #marker - 1,
+      action = "scroll_left",
+    })
+    table.insert(highlights, { col - 1, col - 1 + #marker, "ClaudeCodeTabInactive" })
+    table.insert(parts, marker)
+    col = col + #marker
+    add_separator()
+  end
+
+  for idx, entry in ipairs(layout.entries) do
+    local hl_group = entry.is_active and "ClaudeCodeTabActive" or "ClaudeCodeTabInactive"
+    local label = string.format(" %d:%s ", entry.slot_num, entry.name)
 
     local block = label
     table.insert(slot.click_regions, {
       start_col = col,
       end_col = col + #block - 1,
       action = "switch",
-      session_id = session.id,
+      session_id = entry.session.id,
     })
     table.insert(highlights, { col - 1, col - 1 + #block, hl_group })
     table.insert(parts, block)
     col = col + #block
 
-    if state.config and state.config.show_close_button then
+    if entry.show_close then
       local close_btn = "✕ "
       table.insert(slot.click_regions, {
         start_col = col,
         end_col = col + #close_btn - 1,
         action = "close",
-        session_id = session.id,
+        session_id = entry.session.id,
       })
       table.insert(highlights, { col - 1, col - 1 + #close_btn, hl_group })
       table.insert(parts, close_btn)
       col = col + #close_btn
     end
 
-    if i < #sessions then
-      table.insert(parts, "|")
-      col = col + 1
+    if idx < #layout.entries or layout.right_fold then
+      add_separator()
     end
   end
 
-  if state.config and state.config.show_new_button then
+  -- Right fold marker (clickable: scroll the window one tab right).
+  if layout.right_fold then
+    local marker = "›"
+    table.insert(slot.click_regions, {
+      start_col = col,
+      end_col = col + #marker - 1,
+      action = "scroll_right",
+    })
+    table.insert(highlights, { col - 1, col - 1 + #marker, "ClaudeCodeTabInactive" })
+    table.insert(parts, marker)
+    col = col + #marker
+  end
+
+  if layout.show_new then
+    if #parts > 0 then
+      add_separator()
+    end
     local new_btn = " + "
     table.insert(slot.click_regions, {
       start_col = col,
@@ -159,6 +460,39 @@ local function refocus_terminal(tabpage)
   end
 end
 
+---Scroll the sliding window one tab left/right and re-render. Used by the ‹/›
+---click regions (float path) and the winbar scroll handlers.
+---@param tabpage integer
+---@param dir "left"|"right"
+local function scroll_window(tabpage, dir)
+  local slot = state.tabs[tabpage]
+  if not slot then
+    return
+  end
+  local sessions = list_sessions_for(tabpage)
+  local n = #sessions
+  if n == 0 then
+    return
+  end
+  local start = slot.viewport_start or 1
+  if dir == "left" then
+    start = start - 1
+  else
+    start = start + 1
+  end
+  if start < 1 then
+    start = 1
+  end
+  if start > n then
+    start = n
+  end
+  slot.viewport_start = start
+  -- Honor the explicit scroll: the next render must not snap the window back
+  -- to the active session even if active leaves the window.
+  slot.skip_active_clamp = true
+  M.render(tabpage)
+end
+
 ---Dispatch a left click on the tabbar.
 ---@param tabpage integer
 local function handle_left_click(tabpage)
@@ -183,6 +517,16 @@ local function handle_left_click(tabpage)
       elseif region.action == "new" then
         vim.schedule(function()
           require("claudecode.terminal").open_new_session()
+          refocus_terminal(tabpage)
+        end)
+      elseif region.action == "scroll_left" then
+        vim.schedule(function()
+          scroll_window(tabpage, "left")
+          refocus_terminal(tabpage)
+        end)
+      elseif region.action == "scroll_right" then
+        vim.schedule(function()
+          scroll_window(tabpage, "right")
           refocus_terminal(tabpage)
         end)
       end
@@ -429,15 +773,19 @@ function M.render(tabpage)
     return
   end
 
-  local content, highlights = build_content(tabpage)
-
   if slot.tabbar_win and vim.api.nvim_win_is_valid(slot.tabbar_win) then
+    -- Float path: build the single-line content + highlights and write them.
+    local content, highlights = build_content(tabpage)
     render_float_content(tabpage, slot, content, highlights)
 
     if slot.terminal_win and vim.api.nvim_win_is_valid(slot.terminal_win) then
       apply_float_config(slot, calc_window_config(slot.terminal_win))
     end
   else
+    -- Winbar path: build_winbar_string runs compute_layout itself. Do NOT also
+    -- call build_content here — that would run compute_layout twice and let the
+    -- first invocation consume the one-shot skip_active_clamp flag (set by an
+    -- explicit ‹/› scroll), snapping the window back to the active session.
     M.render_winbar(tabpage)
   end
 end
@@ -491,8 +839,37 @@ function _G.ClaudeCodeNewTabClick(_, _, button, _)
   end
 end
 
+-- Winbar scroll: ‹/› use a fixed click id (0 = left, -1 = right) since they
+-- don't map to a session. Resolve the current tab and scroll its window.
+function _G.ClaudeCodeTabScrollClick(_, _, button, _)
+  if button ~= "l" then
+    return
+  end
+  local ok, tab = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok or not tab then
+    return
+  end
+  vim.schedule(function()
+    scroll_window(tab, "left")
+  end)
+end
+
+function _G.ClaudeCodeTabScrollRightClick(_, _, button, _)
+  if button ~= "l" then
+    return
+  end
+  local ok, tab = pcall(vim.api.nvim_get_current_tabpage)
+  if not ok or not tab then
+    return
+  end
+  vim.schedule(function()
+    scroll_window(tab, "right")
+  end)
+end
+
 -- Build the winbar string for split mode. Populates slot.winbar_session_ids so
--- click handlers can resolve idx → session_id.
+-- click handlers can resolve idx → session_id. Uses the sliding-window layout:
+-- a contiguous slice of sessions with ‹/› fold markers on folded sides.
 local function build_winbar_string(tabpage)
   local slot = state.tabs[tabpage]
   if not slot or not slot.terminal_win or not vim.api.nvim_win_is_valid(slot.terminal_win) then
@@ -505,26 +882,32 @@ local function build_winbar_string(tabpage)
     return nil
   end
 
+  local available_width = vim.api.nvim_win_get_width(slot.terminal_win)
+  local layout = compute_layout(slot, sessions, active_id, available_width)
+
   slot.winbar_session_ids = {}
 
   local parts = {}
-  for i, session in ipairs(sessions) do
-    local is_active = session.id == active_id
-    local name = session.name or ("Session " .. i)
-    if #name > 12 then
-      name = name:sub(1, 9) .. "..."
-    end
 
-    slot.winbar_session_ids[i] = session.id
+  if layout.left_fold then
+    -- %0@...@ is the winbar id reserved for non-session clicks (the new button
+    -- uses it too, but each clickable region is self-contained by %X).
+    local click = "%0@v:lua.ClaudeCodeTabScrollClick@"
+    table.insert(parts, click .. "%#ClaudeCodeTabInactive#‹%X")
+  end
 
-    local hl = is_active and "%#ClaudeCodeTabActive#" or "%#ClaudeCodeTabInactive#"
+  for i, entry in ipairs(layout.entries) do
+    -- Click handler index must match the position in winbar_session_ids, which
+    -- only contains the *rendered* tabs (so a dropped tab never steals a click).
+    slot.winbar_session_ids[i] = entry.session.id
+
+    local hl = entry.is_active and "%#ClaudeCodeTabActive#" or "%#ClaudeCodeTabInactive#"
     local click_start = string.format("%%%d@v:lua.ClaudeCodeTabClick@", i)
     local click_end = "%X"
 
-    local slot_num = session.slot or i
-    local tab_content = hl .. " " .. slot_num .. ":" .. name .. " "
+    local tab_content = hl .. " " .. entry.slot_num .. ":" .. entry.name .. " "
 
-    if state.config and state.config.show_close_button then
+    if entry.show_close then
       local close_click = string.format("%%%d@v:lua.ClaudeCodeCloseTabClick@", i)
       tab_content = tab_content .. click_end .. close_click .. hl .. "✕%X "
     end
@@ -532,7 +915,12 @@ local function build_winbar_string(tabpage)
     table.insert(parts, click_start .. tab_content .. click_end)
   end
 
-  if state.config and state.config.show_new_button then
+  if layout.right_fold then
+    local click = "%0@v:lua.ClaudeCodeTabScrollRightClick@"
+    table.insert(parts, click .. "%#ClaudeCodeTabInactive#›%X")
+  end
+
+  if layout.show_new then
     local click_start = "%0@v:lua.ClaudeCodeNewTabClick@"
     local click_end = "%X"
     table.insert(parts, click_start .. "%#ClaudeCodeTabNew# + " .. click_end)
@@ -845,7 +1233,13 @@ function M.cleanup_all()
   end
   -- Drop the global winbar click handlers so a plugin reload doesn't leave
   -- stale function refs on _G.
-  for _, name in ipairs({ "ClaudeCodeTabClick", "ClaudeCodeCloseTabClick", "ClaudeCodeNewTabClick" }) do
+  for _, name in ipairs({
+    "ClaudeCodeTabClick",
+    "ClaudeCodeCloseTabClick",
+    "ClaudeCodeNewTabClick",
+    "ClaudeCodeTabScrollClick",
+    "ClaudeCodeTabScrollRightClick",
+  }) do
     _G[name] = nil
   end
 end
@@ -861,6 +1255,7 @@ function M._snapshot()
       terminal_win = slot.terminal_win,
       click_regions = vim.deepcopy(slot.click_regions),
       winbar_session_ids = vim.deepcopy(slot.winbar_session_ids),
+      viewport_start = slot.viewport_start,
     }
   end
   return out

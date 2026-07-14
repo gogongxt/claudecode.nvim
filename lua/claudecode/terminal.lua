@@ -314,6 +314,12 @@ function M.get_active_session_id()
   return session_manager_mod.get_active_session_id()
 end
 
+-- The active session table (nil if none). Exposed so callers (e.g. the rename
+-- command) can read its current name without reaching into the session module.
+function M.get_active_session()
+  return session_manager_mod.get_active_session()
+end
+
 -- Get the session id whose terminal buffer is currently focused, if any.
 function M.get_current_session_id()
   local session = session_manager_mod.find_session_by_bufnr(vim.api.nvim_get_current_buf())

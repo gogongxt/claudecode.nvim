@@ -673,6 +673,50 @@ local function session_completion_items()
   return out
 end
 
+-- Call vim.ui.input and make sure the prompt opens typeable (Insert mode).
+--
+-- The native `vim.fn.input` opens the command-line, which has no Normal mode
+-- (`:h mode()` lists only `c`/`cr`), so it is already typeable. The problem is
+-- UI plugins that override `vim.ui.input` (noice.nvim via nui.nvim, some
+-- dressing.nvim configs): they open a buffer-backed float and call `startinsert`
+-- from inside a BufWinEnter/schedule handler. That `startinsert` runs during the
+-- Ex command's event processing and is clobbered by Neovim's post-command mode
+-- restoration (the same quirk noted in terminal/toggleterm.lua's restore_mode),
+-- leaving the prompt in Normal mode where typed keys act as motions.
+--
+-- This wrapper detects the override path (no `CmdlineEnter` fired => not the
+-- native cmdline) and re-issues `startinsert` deferred via `vim.schedule`, so it
+-- lands *after* the command has fully returned and after the provider's own
+-- (clobbered) startinsert. The native path is blocking and sets `used_cmdline`,
+-- so the deferred callback becomes a no-op once the prompt has already closed.
+local function ui_input(opts, on_confirm)
+  local used_cmdline = false
+  local group = vim.api.nvim_create_augroup("ClaudeCodeUiInputProbe", { clear = true })
+  vim.api.nvim_create_autocmd("CmdlineEnter", {
+    group = group,
+    once = true,
+    callback = function()
+      used_cmdline = true
+    end,
+  })
+  vim.ui.input(opts, on_confirm)
+  vim.api.nvim_clear_autocmds({ group = group })
+  if used_cmdline then
+    return
+  end
+  vim.schedule(function()
+    -- Skip if the user already dismissed the prompt (mode returned to a normal
+    -- buffer post-confirm) or the provider already entered Insert on its own.
+    local mode = vim.fn.mode()
+    if mode == "n" or mode == "nt" then
+      -- `startinsert!` (a-like) appends after the cursor; the plain form (i-like)
+      -- inserts before it, which lands the cursor mid-text when the provider
+      -- parked it on the last char of the pre-filled name. `!` puts it at the end.
+      vim.cmd("startinsert!")
+    end
+  end)
+end
+
 ---Set up user commands
 ---@private
 function M._create_commands()
@@ -1308,7 +1352,14 @@ function M._create_commands()
       if arg then
         apply(arg)
       else
-        vim.ui.input({ prompt = "Rename active Claude session:" }, function(input)
+        -- Default to the active session's current name so the user edits in
+        -- place rather than retyping it. `ui_input` ensures the prompt opens
+        -- typeable even under float-based vim.ui.input overrides that start in
+        -- Normal mode (e.g. noice.nvim); the native cmdline is already
+        -- typeable and is left untouched.
+        local active = terminal.get_active_session()
+        local current = active and active.name or nil
+        ui_input({ prompt = "Rename active Claude session: ", default = current }, function(input)
           if input then
             apply(input)
           end
