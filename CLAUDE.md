@@ -155,7 +155,7 @@ opts = {
 - `:ClaudeCodeNew [args]` - Open a new Claude session and focus it
 - `:ClaudeCodeSwitch {index|id|name}` - Switch to a session by 1-based slot, id, or name
 - `:ClaudeCodeCloseSession [{index|id|name}]` - Close a session (default: active)
-- `:ClaudeCodeSessions [{n}]` - Toggle session N (creates it if missing), or pick from a list
+- `:ClaudeCodeSessions [{n}]` - Toggle session N (creates it if missing), or open a picker. With no arg, opens a Snacks.picker (left list / right live terminal preview) when `snacks.picker` is available, falling back to `vim.ui.select`. The right pane shows a snapshot of each session's terminal so you can pick the one to switch to; selecting a session toggles it.
 - `:ClaudeCodeRenameSession [{name}]` - Rename the active session (prompts if no name)
 
 ### Key File Locations

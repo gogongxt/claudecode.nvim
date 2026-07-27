@@ -326,6 +326,25 @@ function M.get_current_session_id()
   return session and session.id or nil
 end
 
+-- Get the terminal buffer number backing a session, if any. Prefers the
+-- provider's authoritative mapping (toggleterm keeps its own per-session
+-- buffer table) and falls back to the session-manager field updated on spawn.
+-- Used by the session picker to read a snapshot of the terminal's visible
+-- content for its preview pane.
+---@param session_id string
+---@return number|nil bufnr
+function M.get_session_bufnr(session_id)
+  local provider = get_provider()
+  if provider and provider.get_session_bufnr then
+    local bufnr = provider.get_session_bufnr(session_id)
+    if bufnr then
+      return bufnr
+    end
+  end
+  local session = session_manager_mod.get_session(session_id)
+  return session and session.terminal_bufnr or nil
+end
+
 ---@return boolean has_open_session Whether the provider exposes per-session terminals.
 local function provider_has_sessions(provider)
   return provider and type(provider.open_session) == "function"

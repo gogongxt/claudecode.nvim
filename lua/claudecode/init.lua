@@ -1317,24 +1317,14 @@ function M._create_commands()
         return
       end
       local active_id = terminal.get_active_session_id()
-      local items = {}
-      for i, s in ipairs(sessions) do
-        local marker = (s.id == active_id) and " *" or ""
-        local slot_num = s.slot or i
-        table.insert(items, {
-          label = string.format("%d. %s%s", slot_num, s.name or s.id, marker),
-          session_id = s.id,
-        })
-      end
-      vim.ui.select(items, {
-        prompt = "Claude Code sessions (toggle):",
-        format_item = function(item)
-          return item.label
-        end,
-      }, function(choice)
-        if choice and choice.session_id then
-          -- toggleterm-style: picking a session toggles its terminal (1 => toggle 1).
-          terminal.toggle_session(choice.session_id, {})
+      -- Left/right Snacks picker: session list on the left, a live snapshot of
+      -- each session's terminal on the right. Falls back to vim.ui.select when
+      -- Snacks.picker isn't installed. Picking a session toggles its terminal
+      -- (toggleterm-style: 1 => toggle 1).
+      local session_picker = require("claudecode.session_picker")
+      session_picker.open(sessions, active_id, function(session_id)
+        if session_id then
+          terminal.toggle_session(session_id, {})
         end
       end)
     end, {
