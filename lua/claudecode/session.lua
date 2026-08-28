@@ -7,7 +7,8 @@ local logger = require("claudecode.logger")
 
 ---@class ClaudeCodeSession
 ---@field id string
----@field slot number 1-based, stable across creations/destructions; gaps reused
+---@field slot number 1-based; compacted on destroy (tmux-style): closing a
+---session renumbers the later ones down so slots stay 1..n with no gaps
 ---@field terminal_bufnr number|nil
 ---@field terminal_winid number|nil
 ---@field terminal_jobid number|nil
@@ -33,6 +34,19 @@ local function next_free_slot()
     slot = slot + 1
   end
   return slot
+end
+
+-- tmux-style renumber: after a destroy, re-pack the remaining sessions to
+-- 1..n in slot order so the tab bar never shows gaps (close 2 of 1,2,3 → 1,2
+-- where the old 3 is now 2). Consumers (tabbar, picker, :ClaudeCodeSwitch)
+-- resolve slots at read time, so they pick the renumbering up automatically.
+local function compact_slots()
+  local ordered = M.list_sessions()
+  used_slots = {}
+  for i, session in ipairs(ordered) do
+    session.slot = i
+    used_slots[i] = true
+  end
 end
 
 local function generate_session_id()
@@ -95,6 +109,33 @@ function M.create_session(opts)
   return session_id
 end
 
+---The session to activate when `session_id` closes (tmux-like): the slot
+---successor that slides into the closed slot after the renumber, or — when
+---closing the tail — the new last session. Nil when it is the only session.
+---Must be called BEFORE the session is removed (it reads slot neighbors).
+---@param session_id string
+---@return ClaudeCodeSession|nil successor
+function M.find_successor(session_id)
+  local session = M.sessions[session_id]
+  if not session then
+    return nil
+  end
+  if session.slot then
+    local successor = M.get_session_by_slot(session.slot + 1)
+    if successor then
+      return successor
+    end
+  end
+  -- No right neighbor: the closed session is the tail; land on the new tail.
+  local ordered = M.list_sessions()
+  for i = #ordered, 1, -1 do
+    if ordered[i].id ~= session_id then
+      return ordered[i]
+    end
+  end
+  return nil
+end
+
 ---@return boolean success
 function M.destroy_session(session_id)
   local session = M.sessions[session_id]
@@ -105,14 +146,18 @@ function M.destroy_session(session_id)
   session.mention_queue = {}
   session.selection = nil
 
-  if session.slot then
-    used_slots[session.slot] = nil
-  end
+  -- Resolve the successor BEFORE removal (it reads slot neighbors). After the
+  -- renumber it occupies the closed slot, so that's where focus lands.
+  local successor = M.find_successor(session_id)
 
   M.sessions[session_id] = nil
 
+  -- Renumber the survivors BEFORE firing the event so its listeners (tabbar,
+  -- pickers) render the already-compacted slots.
+  compact_slots()
+
   if M.active_session_id == session_id then
-    M.active_session_id = next(M.sessions)
+    M.active_session_id = successor and successor.id or nil
   end
 
   logger.debug("session", "Destroyed session: " .. session_id)

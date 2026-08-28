@@ -359,6 +359,32 @@ describe("terminal session activation regression", function()
     expect(session.get_active_session_id()).to_be(s1)
   end)
 
+  it("close_session on a middle active session lands on the slot successor", function()
+    terminal.open({}, nil)
+    terminal.open_new_session({}, nil)
+    terminal.open_new_session({}, nil)
+    local sessions = session.list_sessions()
+    local s2 = sessions[2].id
+    local s3 = sessions[3].id
+
+    -- Make slot 2 the active/displayed one, then close it: the old slot 3
+    -- renumbers into slot 2 and should take both the window and the focus.
+    terminal.switch_to_session(s2, {})
+    expect(session.get_active_session_id()).to_be(s2)
+
+    provider_stub._calls = {}
+    terminal.close_session(s2)
+
+    expect(session.get_active_session_id()).to_be(s3)
+    local keep_window_new_id
+    for _, c in ipairs(provider_stub._calls or {}) do
+      if c[1] == "close_session_keep_window" then
+        keep_window_new_id = c[3]
+      end
+    end
+    expect(keep_window_new_id).to_be(s3)
+  end)
+
   it("close_session on a non-active session keeps the active session", function()
     terminal.open({}, nil)
     terminal.open_new_session({}, nil)

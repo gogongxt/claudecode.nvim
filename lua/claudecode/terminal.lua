@@ -994,14 +994,12 @@ function M.close_session(session_id)
   if session_count > 1 then
     -- Successor is only needed when the closed session was the active (and thus
     -- displayed) one; closing a non-active session leaves the window untouched.
+    -- find_successor gives the tmux-style landing spot: the session that slides
+    -- into the closed slot (slot 1's closer lands on the old 2, etc.).
     local new_active_id
     if was_active then
-      for _, s in ipairs(sm.list_sessions()) do
-        if s.id ~= session_id then
-          new_active_id = s.id
-          break
-        end
-      end
+      local successor = sm.find_successor(session_id)
+      new_active_id = successor and successor.id or nil
     end
 
     if was_active and new_active_id and provider.close_session_keep_window then

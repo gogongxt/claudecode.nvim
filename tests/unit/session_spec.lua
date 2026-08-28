@@ -81,6 +81,59 @@ describe("claudecode.session", function()
       session.destroy_session(id2)
       expect(session.get_active_session_id()).to_be(id1)
     end)
+
+    it("activates the session that slides into the closed middle slot", function()
+      session.create_session() -- slot 1
+      local id2 = session.create_session() -- slot 2
+      local id3 = session.create_session() -- slot 3
+      session.set_active_session(id2)
+      session.destroy_session(id2) -- old 3 renumbers to slot 2 and takes focus
+      expect(session.get_active_session_id()).to_be(id3)
+    end)
+
+    it("activating after closing the first slot lands on the old second", function()
+      local id1 = session.create_session() -- slot 1
+      local id2 = session.create_session() -- slot 2
+      session.set_active_session(id1)
+      session.destroy_session(id1) -- old 2 slides into slot 1 and takes focus
+      expect(session.get_active_session_id()).to_be(id2)
+    end)
+
+    it("keeps the active session when a non-active one is destroyed", function()
+      local id1 = session.create_session()
+      local id2 = session.create_session()
+      session.set_active_session(id2)
+      session.destroy_session(id1)
+      expect(session.get_active_session_id()).to_be(id2)
+    end)
+
+    it("clears the active pointer when the last session is destroyed", function()
+      local id = session.create_session()
+      session.destroy_session(id)
+      expect(session.get_active_session_id()).to_be_nil()
+    end)
+  end)
+
+  describe("find_successor", function()
+    it("returns the slot successor for a middle session", function()
+      local id1 = session.create_session()
+      local id2 = session.create_session()
+      local id3 = session.create_session()
+      expect(session.find_successor(id2).id).to_be(id3)
+      expect(session.find_successor(id1).id).to_be(id2)
+    end)
+
+    it("falls back to the new tail when closing the last slot", function()
+      local id1 = session.create_session()
+      local id2 = session.create_session()
+      expect(session.find_successor(id2).id).to_be(id1)
+    end)
+
+    it("returns nil for the only session and for unknown ids", function()
+      local id = session.create_session()
+      expect(session.find_successor(id)).to_be_nil()
+      expect(session.find_successor("nope")).to_be_nil()
+    end)
   end)
 
   describe("bind_client / unbind_client", function()
@@ -186,12 +239,38 @@ describe("claudecode.session", function()
       expect(session.get_slot(id3)).to_be(2)
     end)
 
-    it("releases a slot on destroy so it gets reused", function()
+    it("renumbers later sessions down when a middle session closes (tmux-style)", function()
+      session.create_session() -- slot 1
+      local id2 = session.create_session() -- slot 2
+      local id3 = session.create_session() -- slot 3
+      session.destroy_session(id2) -- 1,2,3 minus 2 → 1,2
+      expect(session.get_slot(id3)).to_be(2)
+      expect(session.get_session_by_slot(3)).to_be_nil()
+      local slots = {}
+      for _, s in ipairs(session.list_sessions()) do
+        table.insert(slots, s.slot)
+      end
+      expect(#slots).to_be(2)
+      expect(slots[1]).to_be(1)
+      expect(slots[2]).to_be(2)
+    end)
+
+    it("closing the first session promotes the rest down", function()
+      local id1 = session.create_session() -- slot 1
+      local id2 = session.create_session() -- slot 2
+      local id3 = session.create_session() -- slot 3
+      session.destroy_session(id1) -- 1,2,3 minus 1 → 1,2
+      expect(session.get_slot(id2)).to_be(1)
+      expect(session.get_slot(id3)).to_be(2)
+      expect(session.get_slot(id1)).to_be_nil()
+    end)
+
+    it("a session created after a destroy appends at the tail", function()
       local id1 = session.create_session() -- slot 1
       session.create_session() -- slot 2
-      session.destroy_session(id1) -- slot 1 freed
-      local id3 = session.create_session() -- should reuse slot 1
-      expect(session.get_slot(id3)).to_be(1)
+      session.destroy_session(id1) -- survivor renumbers to 1
+      local id3 = session.create_session() -- appended after the compact list
+      expect(session.get_slot(id3)).to_be(2)
     end)
 
     it("get_session_by_slot looks up by stable slot", function()

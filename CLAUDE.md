@@ -69,7 +69,7 @@ The `fixtures/` directory contains test Neovim configurations for verifying plug
 4. **Selection Tracking** (`lua/claudecode/selection.lua`) - Monitors text selections and sends updates to Claude
 5. **Diff Integration** (`lua/claudecode/diff.lua`) - Native Neovim diff support for Claude's file comparisons
 6. **Terminal Integration** (`lua/claudecode/terminal.lua`) - Manages Claude CLI terminal sessions with support for internal Neovim terminals and external terminal applications
-7. **Session Management** (`lua/claudecode/session.lua`) - Global multi-session registry: stable 1-based slots, client<->session binding, and the active-session pointer. Drives @mention routing and the tab bar.
+7. **Session Management** (`lua/claudecode/session.lua`) - Global multi-session registry: compact 1-based slots (tmux-style — closing a session renumbers later ones down, so slots stay 1..n), client<->session binding, and the active-session pointer. Drives @mention routing and the tab bar.
 8. **Window Manager** (`lua/claudecode/terminal/window_manager.lua`) - Singleton owning the single global terminal window; session-aware providers swap per-session buffers into it.
 
 ### WebSocket Server Implementation
@@ -127,7 +127,7 @@ The WebSocket server implements secure authentication using:
 
 **Multi-session infrastructure** (toggleterm provider only):
 
-- **Session manager** (`lua/claudecode/session.lua`) - Owns the global session list, stable 1-based slots, and client<->session binding. Sessions are global (not per-tabpage).
+- **Session manager** (`lua/claudecode/session.lua`) - Owns the global session list, 1-based slots (tmux-style: renumbered compactly on every close), and client<->session binding. Closing the active session activates `find_successor` — the session that slides into the closed slot (the old tail's closer lands on the new tail). Sessions are global (not per-tabpage).
 - **Window manager** (`lua/claudecode/terminal/window_manager.lua`) - Singleton owning THE global terminal window; providers create per-session buffers and swap them via `display_buffer`.
 - **Tab bar** (`lua/claudecode/terminal/tabbar.lua`) - Per-tab UI showing one label per Claude session; click to switch, middle-click to close. Float window over the terminal (or winbar fallback for splits).
 
